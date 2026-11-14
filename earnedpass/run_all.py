@@ -15,13 +15,14 @@ import subprocess
 
 import numpy as np
 
-from . import audit, controls, data as data_mod, decide, models
+from . import audit, controls, data as data_mod, decide, models, reference
 from . import config as C
 from .eval import ladder, splits
 from .eval.bounds import cp_lower, units_needed
 from .eval.conformal import min_alpha
 
 PROBS = C.ARTIFACTS / "band_probs.npz"
+PROBS_REF = C.ARTIFACTS / "band_probs_reference.npz"
 RESULTS = C.ARTIFACTS / "results.json"
 
 
@@ -167,6 +168,25 @@ def main(argv=None) -> None:
     print("lanes, licence and blind-spot map...")
     decision = decision_summary(s, rows, {ss: decide.Probs(p1[i], p3[i], pl[i]) for i, ss in enumerate(sets)})
 
+    print("supplier-reference mode...")
+    ref = reference.run(d, spectra, score_locked=bool(args.score_locked or was_scored))
+    np.savez_compressed(PROBS_REF, sets=np.array(sets), **{k: ref[k] for k in ("p1", "p3", "pl", "t3", "tl", "e3", "el", "is_ref")})
+    ref_rows = []
+    ref_decision = decision_summary(s, ref_rows, {ss: decide.Probs(ref["p1"][i], ref["p3"][i], ref["pl"][i])
+                                                   for i, ss in enumerate(sets)})
+    for r in ref_rows:
+        r["section"] = "reference_decision"
+    rows += ref_rows
+    reference_summary = {
+        "decision": ref_decision,
+        "new_supplier": ref["new_supplier"],
+        "split": {"reference_samples": {c: int((ref["is_ref"] & (s.code == c).to_numpy()).sum()) for c in C.FOLDERS},
+                  "screened_pure_samples": {c: int((~ref["is_ref"] & (s.code == c).to_numpy() & (s.level == 0).to_numpy()).sum())
+                                            for c in C.FOLDERS}},
+        "caveat": "The reference half and the screened pure half come from the same batch, so pure-cinnamon results "
+                  "measure 'same powder as the reference', not a new pure delivery from that supplier.",
+    }
+
     print("controls and Replicate Radar...")
     ctrl = {
         "session_probe": controls.session_probe(d, dev),
@@ -208,6 +228,7 @@ def main(argv=None) -> None:
         "radar": radar,
         "controls": ctrl,
         "decision": decision,
+        "reference": reference_summary,
         "rows": rows,
     }
     RESULTS.write_text(json.dumps(out, indent=1, default=float))

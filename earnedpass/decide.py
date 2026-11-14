@@ -50,10 +50,15 @@ def _band_index(samples) -> np.ndarray:
     return samples.band.map(C.BANDS.index).to_numpy()
 
 
+def _scored(p: np.ndarray) -> np.ndarray:
+    """Rows that have a prediction. Reference samples in supplier-reference mode have none."""
+    return np.isfinite(p).all(1)
+
+
 def calibrate(samples, probs: Probs, mode, alpha, exclude_cell=None):
     """Return (q, n_units). Calibration never uses the cell being judged."""
     y = _band_index(samples)
-    m = ~samples.locked.to_numpy()
+    m = ~samples.locked.to_numpy() & _scored(probs.p1 if mode == "as_labelled" else probs.p3)
     if exclude_cell is not None:
         m &= (samples.cell != exclude_cell).to_numpy()
     if mode == "as_labelled":
@@ -86,9 +91,9 @@ def screen(samples, probs: Probs, st: Settings, pool="dev") -> pd.DataFrame:
     """
     locked = samples.locked.to_numpy()
     if pool == "dev":
-        rows, p = np.flatnonzero(~locked), probs.p3
+        rows, p = np.flatnonzero(~locked & _scored(probs.p3)), probs.p3
     elif pool == "locked":
-        rows, p = np.flatnonzero(locked), probs.pl
+        rows, p = np.flatnonzero(locked & _scored(probs.pl)), probs.pl
         if not probs.locked_scored:
             raise RuntimeError("the locked cells have not been scored yet")
     else:
@@ -248,7 +253,7 @@ def evaluate(samples, probs: Probs, st: Settings) -> Result:
     held = np.where(df.pool.to_numpy()[:, None] == "dev", probs.p3[df.row], probs.pl[df.row])
     p_held = np.full_like(probs.p3, np.nan)
     p_held[df.row] = held
-    dev = np.flatnonzero(~samples.locked.to_numpy())
+    dev = np.flatnonzero(~samples.locked.to_numpy() & _scored(probs.p1))
     return Result(st, df, cl, lic, metrics(df, st.alpha), forced_baseline(samples, p_held, df.row.to_numpy()),
                   forced_baseline(samples, probs.p1, dev), tiles(df), pools)
 
@@ -280,7 +285,7 @@ def threshold_fallback(samples, probs: Probs, alpha, must_catch) -> dict:
     tau is chosen on the rung-3 out-of-fold predictions and scored on the same
     predictions, so its numbers are optimistic. Reported for completeness only.
     """
-    dev = np.flatnonzero(~samples.locked.to_numpy())
+    dev = np.flatnonzero(~samples.locked.to_numpy() & _scored(probs.p3))
     pr, y = probs.p3[dev], _band_index(samples)[dev]
     top, call = pr.max(1), pr.argmax(1)
     hb = [C.BANDS.index(b) for b in hold_bands(must_catch)]

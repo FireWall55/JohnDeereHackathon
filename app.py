@@ -16,12 +16,12 @@ import streamlit as st
 
 from earnedpass import config as C
 from earnedpass import data as data_mod
-from earnedpass import decide, models
+from earnedpass import decide, models, scoreboard
 from earnedpass.eval.bounds import cp_lower, units_needed
 from earnedpass.eval.conformal import min_alpha
 from earnedpass.eval.ladder import HEADLINE
 from earnedpass.features import color
-from earnedpass.run_all import PROBS, RESULTS
+from earnedpass.run_all import PROBS, PROBS_REF, RESULTS
 
 LOG = C.ARTIFACTS / "decision_log.csv"
 LOG_COLUMNS = ["time", "sample_id", "model_version", "mode", "must_catch", "alpha", "pass_bar", "sensors",
@@ -43,21 +43,31 @@ st.set_page_config(page_title="Earned Pass", page_icon="🧪", layout="wide")
 
 
 # ---------------------------------------------------------------- loading
-@st.cache_resource(show_spinner="Loading artifacts...")
-def load(_stamp):
-    d = data_mod.get()
-    results = json.loads(RESULTS.read_text())
-    z = np.load(PROBS)
+def _read(path):
+    z = np.load(path)
     probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i]) for i, ss in enumerate(z["sets"])}
     types = {ss: (z["t3"][i], z["tl"][i]) for i, ss in enumerate(z["sets"])} if "t3" in z else None
     levels = {ss: (z["e3"][i], z["el"][i]) for i, ss in enumerate(z["sets"])} if "e3" in z else None
-    return d, results, probs, models.Spectra(d.X_ftir), types, levels
+    is_ref = z["is_ref"] if "is_ref" in z else None
+    return probs, types, levels, is_ref
+
+
+def load(_stamp):
+    d = data_mod.get()
+    results = json.loads(RESULTS.read_text())
+    art = {"general": _read(PROBS)}
+    if PROBS_REF.exists() and "reference" in results:
+        art["supplier"] = _read(PROBS_REF)
+    return d, results, art, models.Spectra(d.X_ftir)
+
+
+load = st.cache_resource(show_spinner="Loading artifacts...")(load)
 
 
 @st.cache_resource(show_spinner=False)
-def evaluate(_stamp, mode, alpha, must_catch, bar, sensor_set):
-    d, _, probs, _, _, _ = load(_stamp)
-    return decide.evaluate(d.samples, probs[sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
+def evaluate(_stamp, ref, mode, alpha, must_catch, bar, sensor_set):
+    d, _, art, _ = load(_stamp)
+    return decide.evaluate(d.samples, art[ref][0][sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
 
 
 if not (RESULTS.exists() and PROBS.exists()):
@@ -66,7 +76,7 @@ if not (RESULTS.exists() and PROBS.exists()):
     st.stop()
 
 STAMP = RESULTS.stat().st_mtime
-D, R, PROBS_BY_SET, SPECTRA, TYPES, LEVEL_EST = load(STAMP)
+D, R, ART, SPECTRA = load(STAMP)
 S = D.samples
 SCORED = bool(R["meta"]["locked_scored_at"])
 
@@ -81,6 +91,17 @@ with st.sidebar:
     def note(text):
         if EXPLAIN:
             st.caption(text)
+
+    REF_LABEL = {"general": "Pure cinnamon in general", "supplier": "The supplier's own reference sample"}
+    REF = st.radio("Compare each sample with", [k for k in REF_LABEL if k in ART], format_func=REF_LABEL.get,
+                   help="Supplier reference: each folder stands in for one supplier, and half of its pure batch is "
+                        "kept as that supplier's retained reference sample.")
+    note("**In general** asks “does this look like pure cinnamon?”, learned from three pure batches that look different "
+         "from each other. **Supplier reference** asks “how different is this from the pure sample this supplier gave "
+         "us?”, which is how a receiving inspector usually checks.")
+    if REF == "supplier":
+        st.caption("⚠️ The reference and the pure samples it is tested on come from the same batch, so its results on "
+                   "pure cinnamon are optimistic.")
 
     MODE = st.radio("How to count repeated measurements", list(MODE_LABEL), format_func=MODE_LABEL.get,
                     help="Technical names: replicate-aware and as labelled. A material (one filler at one level) is called a cell.")
@@ -117,8 +138,9 @@ with st.sidebar:
     st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"] if SCORED
                else "locked cells (levels 3, 10, 18) not scored yet"))
 
-RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, SENSORS)
-LAB_RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, C.LAB_SET)
+PROBS_BY_SET, TYPES, LEVEL_EST, IS_REF = ART[REF]
+RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, SENSORS)
+LAB_RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, C.LAB_SET)
 
 
 def pct(x, digits=1):
@@ -158,7 +180,9 @@ def pass_status():
     lic, cl = RES.licence, RES.claims
     unit = lic["unit"]
     if lic["licensed"]:
-        st.success(f"✓ **PASS is available.** The screen has proven both of its PASS promises to at least {pct(BAR, 0)}.")
+        st.success(f"✓ **PASS is available.** The screen has proven both of its PASS promises to at least {pct(BAR, 0)}."
+                   + (" The pure-cinnamon promise was tested on the same batch as the supplier's reference, so treat it "
+                      "as optimistic." if REF == "supplier" else ""))
         return
     ref, catch = cl["reference"][unit], cl["catch"][unit]
     what = "samples" if unit == "samples" else "materials"
@@ -169,9 +193,12 @@ def pass_status():
         f"{what}, which proves **{pct(catch['bound'])}**. {'✓' if catch['bound'] >= BAR else '✗'}\n"
         f"2. *It recognises a batch of pure cinnamon it has not seen before.* It managed this for {ref['k']:,} of "
         f"{ref['n']:,} {what}, which proves **{pct(ref['bound'])}**. {'✓' if ref['bound'] >= BAR else '✗'}\n\n"
-        "The dataset has only three batches of pure cinnamon and they look different from each other, so pure cinnamon from "
-        "a new batch looks adulterated to the screen. Until that is fixed with more pure-cinnamon evidence, every sample "
-        "goes to **LAB** or **HOLD**. See Evidence → PASS licence for the numbers.")
+        + ("The dataset has only three batches of pure cinnamon and they look different from each other, so pure cinnamon "
+           "from a new batch looks adulterated to the screen. Until that is fixed with more pure-cinnamon evidence, every "
+           "sample goes to **LAB** or **HOLD**." if REF == "general" else
+           "Comparing with the supplier's reference helps, but there are still only three suppliers' pure batches to "
+           "learn from, and careful counting treats each as one piece of evidence.")
+        + " See Evidence → PASS licence for the numbers.")
 
 
 FILLER_SURE = 0.80  # below this the screen says it cannot tell which filler
@@ -186,7 +213,7 @@ def filler_guess(cur, pool, row):
     p = (tl if pool == "locked" else t3)[cur]
     codes = list(C.FOLDERS)
     top = int(np.argmax(p))
-    blends = D.dev[S.level.to_numpy()[D.dev] > 0]
+    blends = D.dev[(S.level.to_numpy()[D.dev] > 0) & np.isfinite(t3[D.dev]).all(1)]
     hit = float((t3[blends].argmax(1) == S.code.iloc[blends].map(codes.index).to_numpy()).mean())
     lead = "**If there is filler, most likely:**" if row.in_zero else "**Likely filler:**"
     if row.candidate == "PASS":
@@ -223,6 +250,7 @@ def level_estimate(cur, pool):
     e3, el = LEVEL_EST[SENSORS]
     est = float((el if pool == "locked" else e3)[cur])
     dev = D.dev
+    dev = dev[np.isfinite(e3[dev])]
     margin = float(np.quantile(np.abs(e3[dev] - S.level.to_numpy()[dev]), 0.8))
     return est, margin
 
@@ -309,6 +337,7 @@ def page_inspect():
             rows.update(truth_checks(cur, pool, row, smp))
         else:
             rows["Ground truth"] = "hidden until you record a decision"
+        rows["Compared with"] = reference_name(smp)
         rows.update({"L* (lightness)": f"{smp.L:.1f}", "a* (green to red)": f"{smp.a:.1f}", "b* (blue to yellow)": f"{smp.b:.1f}",
                      "ΔE to its reference": f"{reference_delta(cur, pool):.1f}"})
         st.dataframe(pd.DataFrame({"This sample": rows}), width="stretch")
@@ -322,7 +351,8 @@ def page_inspect():
     label = "Record and release without a lab check" if decision == "PASS" else "Record and send to lab"
     if b.button(label, disabled=revealed):
         append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
-                        model_version=R["meta"]["model_version"], mode=MODE, must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
+                        model_version=R["meta"]["model_version"], mode=MODE + ("+supplier_reference" if REF == "supplier" else ""),
+                        must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
                         sensors=SENSORS, recommended=row.lane, decision=decision, override=decision != row.lane,
                         sent_to_lab=decision != "PASS", user=USER))
         if decision != "PASS":
@@ -375,8 +405,10 @@ def page_inspect():
             f"or more · {CONF}% sure. " +
             ("Samples come from the 9 locked cells, judged by the model trained on the 30 open cells. " if SCORED else
              "Samples come from the 30 open materials, each judged by a model that never saw that material. ") +
-            "Lab-prepared blends, three fillers, 0 to 24% by weight. One reading describes one ground sample, not a container. "
-            "ΔE is measured against the pure-cinnamon sample from the same folder when the model may see one, otherwise "
+            "Lab-prepared blends, three fillers, 0 to 24% by weight. One reading describes one ground sample, not a container. " +
+            ("ΔE is measured against the supplier's reference sample (half of that folder's pure batch, never screened "
+             "itself). " if REF == "supplier" else "") +
+            "In general mode, ΔE is measured against the pure-cinnamon sample from the same folder when the model may see one, otherwise "
             "against the average of the other folders.")
 
     with st.expander("How to read this page"):
@@ -702,8 +734,21 @@ def tab_controls():
 
 def page_evidence():
     st.title("Evidence")
-    st.caption(f"{MODE_LABEL[MODE]} · instruments: {SET_LABEL[SENSORS]} · must catch {MUST}% or more · {CONF}% sure · PASS needs {pct(BAR, 0)} proof. "
-               "Change these in the sidebar.")
+    st.caption(f"Compared with {REF_LABEL[REF].lower()} · {MODE_LABEL[MODE]} · instruments: {SET_LABEL[SENSORS]} · must catch "
+               f"{MUST}% or more · {CONF}% sure · PASS needs {pct(BAR, 0)} proof. Change these in the sidebar.")
+    if REF == "supplier":
+        ns = R["reference"]["new_supplier"][SENSORS]
+        sp = R["reference"]["split"]
+        st.info(
+            "**Supplier-reference mode.** Each folder stands in for one supplier. Half of its pure batch "
+            f"({', '.join(f'{v} {C.FOLDER_LABEL[c]}' for c, v in sp['reference_samples'].items())} samples) is kept as that "
+            "supplier's reference and never screened; every measurement is compared with it. PASS licence, blind-spot map and "
+            "review lane below use this mode. Stress ladder, Replicate Radar and Controls do not change.\n\n"
+            "**Limits.** The screened pure samples come from the same batch as the reference, so pure-cinnamon results are "
+            "optimistic. **New supplier test** (the model never saw that supplier's samples, and is given only its reference): "
+            f"{pct(ns['blends_flagged'], 0)} of blends flagged, {pct(ns['pure_recognised'], 0)} of pure samples recognised. "
+            "By supplier, blends flagged: " + ", ".join(f"{C.FOLDER_LABEL[c]} {pct(v['blends_flagged'], 0)}"
+                                                       for c, v in ns["by_supplier"].items()) + ".")
     tabs = st.tabs(["Replicate Radar", "Stress ladder", "PASS licence", "Blind-spot map", "Review lane vs forced calls", "Controls"])
     for tab, fn in zip(tabs, (tab_radar, tab_ladder, tab_licence, tab_blind_spot, tab_review, tab_controls)):
         with tab:
@@ -724,9 +769,18 @@ def filler_short(cur, pool, row) -> str:
     return f"{C.FOLDER_LABEL[list(C.FOLDERS)[top]]} (model {pct(p[top], 0)})" + (", if there is any" if row.in_zero else "")
 
 
+def reference_name(smp) -> str:
+    if REF == "supplier":
+        return f"the {C.FOLDER_LABEL[smp.code]} supplier's reference sample"
+    return "pure cinnamon in general"
+
+
 def reference_delta(cur, pool) -> float:
     """Colour distance to the 0% reference the model may see for this sample."""
     smp, dev = S.iloc[cur], D.dev
+    if REF == "supplier":
+        ref = S[IS_REF & (S.code == smp.code).to_numpy()][["L", "a", "b"]].mean().to_numpy()
+        return float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - ref))
     train = dev[S.cell.to_numpy()[dev] != smp.cell] if pool == "dev" else dev
     refs = color.references(S, train)
     return float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - refs.get(smp.code, refs[None])))
@@ -758,8 +812,12 @@ def page_compare():
             st.subheader(f"Sample {side}")
             a, b = st.columns([2, 1])
             cell = a.selectbox("Material", cells, format_func=cell_name, key=f"cmp_cell_{side}")
-            rep_no = b.number_input("Sample number", 1, 50, 1, key=f"cmp_rep_{side}",
-                                    help="Each material has 50 samples, numbered 1 to 50.")
+            reps = sorted(S.rep.iloc[df.index[df.cell == cell]].astype(int))
+            if st.session_state.get(f"cmp_rep_{side}") not in reps:
+                st.session_state[f"cmp_rep_{side}"] = reps[0]
+            rep_no = b.selectbox("Sample number", reps, key=f"cmp_rep_{side}",
+                                 help="Each material has up to 50 samples. In supplier-reference mode, half of each pure "
+                                      "batch is kept as the reference and is not offered here.")
             cur = int(np.flatnonzero(((S.cell == cell) & (S.rep == rep_no)).to_numpy())[0])
             row, smp = df.loc[cur], S.iloc[cur]
             picked[side] = (cur, row, smp)
@@ -814,6 +872,105 @@ def page_compare():
                "can be longer than the bars suggest.")
 
 
+# ---------------------------------------------------------------- Scoreboard
+def _fmt(key, v):
+    if v != v:  # NaN
+        return "–"
+    return f"{v:.1f}" if key == "amount_error" else (f"{v:,}" if key in ("n", "materials") else pct(v))
+
+
+def mode_numbers(ref, pool="dev"):
+    """Headline, baseline and model numbers for one reference mode, current settings."""
+    res = evaluate(STAMP, ref, MODE, ALPHA, MUST, BAR, SENSORS)
+    df = res.df[res.df.pool == pool]
+    _, types, levels, _ = ART[ref]
+    rows = df.row.to_numpy()
+    lv, codes = S.level.to_numpy(), S.code.map(list(C.FOLDERS).index).to_numpy()
+    est = (levels[SENSORS][1 if pool == "locked" else 0]) if levels else None
+    typ = (types[SENSORS][1 if pool == "locked" else 0]) if types else None
+    out = scoreboard.from_lanes(df)
+    out["amount_error"] = scoreboard.amount_error(est, rows, lv) if est is not None else float("nan")
+    out["filler_right"] = scoreboard.filler_right(typ, rows, lv, codes) if typ is not None else float("nan")
+    return out, scoreboard.forced(df)
+
+
+def page_scoreboard():
+    st.title("Scoreboard")
+    st.caption(f"How well the screen does on materials it has never seen. Settings from the sidebar: compared with "
+               f"{REF_LABEL[REF].lower()} · {MODE_LABEL[MODE].lower()} · {SET_LABEL[SENSORS]} · must catch {MUST}% or "
+               f"more · {CONF}% sure.")
+    st.info("**In plain words:** each sample here was judged by a model that had never seen that material. "
+            "These are the fair numbers. Scores on samples the model has seen near-copies of are much higher and are "
+            "shown in section 3 only for contrast.")
+
+    cur, _ = mode_numbers(REF)
+    st.subheader("1 · At a glance")
+    cards = [
+        ("wrong_pass", "Released without a lab check although adulterated. The most serious error.", cur["wrong_pass"] == 0, "target 0%"),
+        ("pure_held", "Pure cinnamon held back: a delay and a lab fee for nothing.", cur["pure_held"] <= 0.05, "target ≤ 5%"),
+        ("decided", "Samples the screen settled itself. The rest go to the lab, so higher means more lab work saved.", None, "higher is better"),
+        ("decided_right", "Of the PASS and HOLD calls it made, how many were correct.", cur["decided_right"] >= 0.95, "target ≥ 95%"),
+        ("range_has_truth", f"How often the true amount falls in the screen's range. You asked for {CONF}%.",
+         cur["range_has_truth"] >= CONF / 100, f"target ≥ {CONF}%"),
+    ]
+    cols = st.columns(len(cards))
+    for col, (key, text, ok, target) in zip(cols, cards):
+        mark = "" if ok is None else ("✓ " if ok else "✗ ")
+        short = {"wrong_pass": "Adulterated passed", "pure_held": "Pure held", "decided": "Decided",
+                 "decided_right": "Right decisions", "range_has_truth": "Range has truth"}[key]
+        col.metric(short, _fmt(key, cur[key]), help=scoreboard.LABEL[key])
+        col.caption(f"{mark}{target}. {text}")
+    if REF == "supplier":
+        st.caption("⚠️ Supplier reference: the pure samples tested come from the same batch as the reference, so the "
+                   "pure-cinnamon numbers are optimistic.")
+
+    st.subheader("2 · Side by side")
+    gen, base = mode_numbers("general")
+    cols_data = {"General screen": gen}
+    if "supplier" in ART:
+        cols_data["Supplier reference"] = mode_numbers("supplier")[0]
+    cols_data["Forced-answer baseline"] = {**base, "amount_error": gen["amount_error"], "filler_right": gen["filler_right"]}
+    keys = scoreboard.HEADLINE + ["amount_error", "filler_right", "n", "materials"]
+    side = pd.DataFrame({name: [_fmt(k, d[k]) for k in keys] for name, d in cols_data.items()},
+                        index=[scoreboard.LABEL[k] for k in keys])
+    st.dataframe(side, width="stretch")
+    st.caption("The forced-answer baseline is the general screen's model made to answer every sample: PASS if its top "
+               "guess is 0%, HOLD otherwise. It never abstains, so it gives no range. Its amount and filler rows are the "
+               "general model's. “Right” is scored as on Inspect: HOLD on any adulterated sample counts as right.")
+
+    st.subheader("3 · Easy test against fair test")
+    st.caption("Easy: the model has seen near-copies of the test samples (random split). Fair: it has never seen the "
+               "material. The drop shows how much of the easy score came from recognising repeats.")
+    ev = scoreboard.easy_vs_fair(pd.DataFrame(R["rows"]))
+    show = pd.DataFrame({"Instruments": ev.sensor_set.map(SET_LABEL)})
+    for name in ("Pure vs adulterated (balanced accuracy)", "Filler level band (macro-F1)", "Amount error (points)"):
+        e, f = ev[f"{name} · easy"], ev[f"{name} · fair"]
+        digits = 1 if "points" in name else 2
+        show[name] = [f"{a:.{digits}f} → {b:.{digits}f}" for a, b in zip(e, f)]
+    st.dataframe(show, hide_index=True, width="stretch")
+    st.caption("Balanced accuracy: 0.50 is coin-flip. Macro-F1: 0 to 1, each band weighted equally. Amount error: "
+               "average distance from the true filler percentage. These come from the general screen.")
+
+    st.subheader("4 · Final test: the locked materials")
+    if not SCORED:
+        st.warning("🔒 **Not scored yet.** Levels 3%, 10% and 18% of every filler (9 materials, 450 samples) have never been "
+                   "used for training, tuning or any number on this page. They are scored once, at the end. Those are the "
+                   "numbers to quote.")
+        st.code(".venv/bin/python -m earnedpass.run_all --score-locked", language="bash")
+    else:
+        st.success(f"Scored once at {R['meta']['locked_scored_at']}. These are the numbers to quote.")
+        locked = {"General screen": mode_numbers("general", "locked")[0]}
+        if "supplier" in ART:
+            locked["Supplier reference"] = mode_numbers("supplier", "locked")[0]
+        st.dataframe(pd.DataFrame({n: [_fmt(k, d[k]) for k in keys] for n, d in locked.items()},
+                                  index=[scoreboard.LABEL[k] for k in keys]), width="stretch")
+
+    csv = pd.concat([side.rename_axis("metric").reset_index().assign(table="side_by_side"),
+                     show.assign(table="easy_vs_fair")], ignore_index=True)
+    st.download_button("Download these tables (CSV)", csv.to_csv(index=False).encode(), "earned_pass_scoreboard.csv",
+                       "text/csv")
+
+
 # ---------------------------------------------------------------- Log
 def page_log():
     st.title("Decision log")
@@ -834,6 +991,7 @@ def page_log():
 st.navigation([
     st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
     st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
+    st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
     st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
     st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"),
 ]).run()
