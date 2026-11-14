@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+scikit-learn
+pillow
+openpyxl
+pyarrow
+plotly
+streamlit
+pytest

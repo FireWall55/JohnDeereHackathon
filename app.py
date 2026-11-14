@@ -1,0 +1,554 @@
+"""Earned Pass: a receiving screen for ground cinnamon.
+
+    streamlit run app.py
+
+Reads artifacts written by `python -m earnedpass.run_all`.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from earnedpass import config as C
+from earnedpass import data as data_mod
+from earnedpass import decide, models
+from earnedpass.eval.bounds import cp_lower, units_needed
+from earnedpass.eval.conformal import min_alpha
+from earnedpass.eval.ladder import HEADLINE
+from earnedpass.features import color
+from earnedpass.run_all import PROBS, RESULTS
+
+LOG = C.ARTIFACTS / "decision_log.csv"
+LOG_COLUMNS = ["time", "sample_id", "model_version", "mode", "must_catch", "alpha", "pass_bar", "sensors",
+               "recommended", "decision", "override", "sent_to_lab", "user"]
+
+# Status colours always travel with an icon and a word, never alone.
+LANE = {
+    "PASS": {"icon": "✓", "colour": "#0ca30c", "text": "no lab check for this sample"},
+    "LAB": {"icon": "⧖", "colour": "#fab219", "text": "routine lab confirmation"},
+    "HOLD": {"icon": "⚠", "colour": "#d03b3b", "text": "strong suspicion: the lot waits and its lab check goes first"},
+}
+FILLER_COLOUR = {"P": "#2a78d6", "W": "#eb6834", "D": "#1baf7a"}
+SEQ = [[0.0, "#cde2fb"], [0.5, "#3987e5"], [1.0, "#0d366b"]]
+SET_LABEL = {"colour": "Colorimeter", "ftir": "FTIR", "image": "Photo", "colour+ftir": "Colorimeter + FTIR",
+             "colour+image": "Colorimeter + photo", "ftir+image": "FTIR + photo", "all": "All three"}
+UNIT_WORD = {"as_labelled": "samples", "replicate_aware": "independent cells"}
+
+st.set_page_config(page_title="Earned Pass", page_icon="🧪", layout="wide")
+
+
+# ---------------------------------------------------------------- loading
+@st.cache_resource(show_spinner="Loading artifacts...")
+def load(_stamp):
+    d = data_mod.get()
+    results = json.loads(RESULTS.read_text())
+    z = np.load(PROBS)
+    probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i]) for i, ss in enumerate(z["sets"])}
+    return d, results, probs, models.Spectra(d.X_ftir)
+
+
+@st.cache_resource(show_spinner=False)
+def evaluate(_stamp, mode, alpha, must_catch, bar, sensor_set):
+    d, _, probs, _ = load(_stamp)
+    return decide.evaluate(d.samples, probs[sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
+
+
+if not (RESULTS.exists() and PROBS.exists()):
+    st.error("No results yet. Build them first:")
+    st.code("python -m earnedpass.run_all", language="bash")
+    st.stop()
+
+STAMP = RESULTS.stat().st_mtime
+D, R, PROBS_BY_SET, SPECTRA = load(STAMP)
+S = D.samples
+SCORED = bool(R["meta"]["locked_scored_at"])
+
+with st.sidebar:
+    st.header("Qualification")
+    st.caption("Set by the QC manager before go-live. Defaults are illustrative, not regulatory limits.")
+    MODE = st.radio("How evidence is counted", list(decide.MODES), index=1, format_func=decide.MODES.get,
+                    help="As labelled: all 50 sample IDs in a cell count as independent. Replicate-aware: the 50 are "
+                         "repeat measurements of one adulterant at one level, so the cell counts once.")
+    MUST = st.select_slider("Must-catch level (% w/w)", decide.MUST_CATCH_OPTIONS, value=C.MUST_CATCH,
+                            help="Blends at or above this level must never be passed. Sits on a band edge.")
+    ALPHA = st.slider("Band-set miss rate α", 0.02, 0.30, C.ALPHA, 0.01,
+                      help="The band set should contain the true band in at least 1 − α of cases.")
+    BAR = st.slider("PASS bar", 0.50, 0.99, C.PASS_BAR, 0.01, help="Both PASS claims must be certified at or above this.")
+    SENSORS = st.selectbox("Screen sensors", list(C.SENSOR_SETS), index=list(C.SENSOR_SETS).index(C.SCREEN_SET),
+                           format_func=SET_LABEL.get)
+    USER = st.text_input("Inspector", "inspector-1")
+    st.divider()
+    st.caption("The tool recommends; the inspector decides.")
+    st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"] if SCORED
+               else "locked cells (levels 3, 10, 18) not scored yet"))
+
+RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, SENSORS)
+LAB_RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, C.LAB_SET)
+
+
+def pct(x, digits=1):
+    return f"{x:.{digits}%}"
+
+
+def chart(fig, height=320, **kw):
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=10), **kw)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+def lane_card(lane, body):
+    m = LANE[lane]
+    st.markdown(
+        f"""<div style="border-left:6px solid {m['colour']};padding:.6rem 1rem;border-radius:6px;
+        background:color-mix(in srgb,{m['colour']} 9%,transparent)">
+        <div style="font-size:1.9rem;font-weight:700;line-height:1.2">{m['icon']} {lane}</div>
+        <div style="opacity:.8;margin-bottom:.4rem">{m['text']}</div><div>{body}</div></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def cell_name(cell: str) -> str:
+    """'CW6' -> 'Walnut shell, 6%'. Also accepts a full sample ID such as 'CW6S24'."""
+    code, level = cell[1], cell[2:].split("S")[0]
+    return f"0% ({C.FOLDER_LABEL[code]} folder)" if level == "0" else f"{C.FOLDER_LABEL[code]}, {level}%"
+
+
+def describe(sample) -> str:
+    if sample.level == 0:
+        return f"{sample.sample_id}: 0%, the unblended material in the {C.FOLDER_LABEL[sample.code]} folder"
+    return f"{sample.sample_id}: {C.FOLDER_LABEL[sample.code]}, {sample.level}% w/w"
+
+
+def append_log(row: dict):
+    pd.DataFrame([row], columns=LOG_COLUMNS).to_csv(LOG, mode="a", header=not LOG.exists(), index=False)
+
+
+# ---------------------------------------------------------------- Inspect
+def page_inspect():
+    st.title("Sample screening")
+    pool = "locked" if SCORED else "dev"
+    df = RES.df[RES.df.pool == pool].set_index("row")
+    st.caption(
+        ("Samples come from the 9 locked cells, judged by the model trained on the 30 open cells. " if SCORED else
+         "Until the locked cells are scored, samples come from the 30 open cells, each judged by a model that never saw "
+         "its cell. ") + "Lab-prepared blends, three fillers, 0 to 24% w/w. One reading describes one ground sample, not a container."
+    )
+    with st.expander("Demo controls"):
+        cells = ["Any cell"] + sorted(df.cell.unique(), key=lambda c: (c[1], int(c[2:])))
+        pick = st.selectbox("Draw the next sample from", cells, format_func=lambda c: c if c == "Any cell" else cell_name(c),
+                            help="For rehearsing the demo. An inspector would not know this.")
+
+    def draw():
+        choices = df.index[df.cell == pick] if pick != "Any cell" else df.index
+        st.session_state.cur = int(np.random.default_rng().choice(choices))
+        st.session_state.revealed = None
+
+    if st.session_state.get("cur") not in df.index:
+        draw()
+    st.button("Next sample", on_click=draw, type="primary")
+
+    cur = st.session_state.cur
+    row, smp = df.loc[cur], S.iloc[cur]
+    revealed = st.session_state.get("revealed") == cur
+
+    dev = D.dev
+    train = dev[S.cell.to_numpy()[dev] != smp.cell] if pool == "dev" else dev
+    refs = color.references(S, train)
+    own_ref = smp.code in refs
+    dE = float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - refs.get(smp.code, refs[None])))
+
+    left, mid, right = st.columns([1.1, 1, 1.7], gap="large")
+    with left:
+        st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d} · sample screened")
+    with mid:
+        st.subheader("Colour reading")
+        a, b = st.columns(2)
+        a.metric("L*", f"{smp.L:.1f}")
+        b.metric("a*", f"{smp.a:.1f}")
+        a.metric("b*", f"{smp.b:.1f}")
+        b.metric("ΔE to reference", f"{dE:.1f}")
+        st.caption("Reference: the retained 0% sample from this source." if own_ref else
+                   "No retained 0% sample from this source is available to the model, so the reference is the average of the other sources.")
+    with right:
+        lane_card(row.lane, decide.reason(row, RES))
+        kept = [b for b in C.BANDS if row[f"in_{b}"]]
+        st.markdown("**Bands the screen cannot rule out:** " + (" ".join(f"`{b} {C.BAND_RANGE[b]}`" for b in kept) or "none"))
+        st.caption(f"Calibrated on {int(row.n_units):,} {UNIT_WORD[MODE]} · sensors: {SET_LABEL[SENSORS]} · "
+                   f"must-catch {MUST}% · α {ALPHA:.2f}")
+        fig = go.Figure(go.Bar(
+            y=[f"{b} ({C.BAND_RANGE[b]})" + ("  ● kept" if row[f"in_{b}"] else "") for b in C.BANDS][::-1],
+            x=[row[f"p_{b}"] for b in C.BANDS][::-1], orientation="h", marker_color="#2a78d6", width=0.5,
+            text=[pct(row[f"p_{b}"], 0) for b in C.BANDS][::-1], textposition="outside", cliponaxis=False,
+            hovertemplate="%{y}: %{x:.1%}<extra></extra>"))
+        chart(fig, 190, title="Model probability by band", xaxis=dict(range=[0, 1.12], tickformat=".0%", showgrid=False))
+
+    st.divider()
+    st.subheader("Inspector decision")
+    decision = st.radio("Your decision", list(LANE), index=list(LANE).index(row.lane), horizontal=True, key=f"decision{cur}",
+                        format_func=lambda k: f"{LANE[k]['icon']} {k}", disabled=revealed)
+    if decision != row.lane:
+        st.warning(f"This overrides the recommendation ({row.lane}). The override is recorded under your name.")
+    label = "Record decision and release without a lab check" if decision == "PASS" else "Record decision and send to lab"
+    if st.button(label, disabled=revealed):
+        append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
+                        model_version=R["meta"]["model_version"], mode=MODE, must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
+                        sensors=SENSORS, recommended=row.lane, decision=decision, override=decision != row.lane,
+                        sent_to_lab=decision != "PASS", user=USER))
+        if decision != "PASS":
+            st.session_state.setdefault("queue", []).append(
+                dict(sample=f"#{cur:04d}", lane=decision, p_must_catch=float(row.p_must_catch)))
+        st.session_state.revealed = cur
+        st.rerun()
+
+    if revealed:
+        lab = LAB_RES.df.set_index("row").loc[cur]
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**FTIR lane** (same rules, lab spectrum)")
+            st.markdown(f"Bands not ruled out: `{lab['set']}` · most likely: `{lab.top_band} {C.BAND_RANGE[lab.top_band]}`")
+            st.caption("A model reading of the stored spectrum, not a reference test.")
+        with b:
+            st.markdown("**Dataset label**")
+            st.markdown(describe(smp))
+        last = pd.read_csv(LOG).query("sample_id == @smp.sample_id").iloc[-1]
+        if last.decision == "PASS" and smp.level > 0:
+            st.error("A blend was released without a lab check. This is the error the PASS licence exists to prevent.")
+        elif last.decision == "HOLD" and smp.level == 0:
+            st.warning("A 0% sample was held: a delay and a lab fee, and the lab check clears it.")
+        elif last.decision == "PASS":
+            st.success("A 0% sample was released without a lab check.")
+        else:
+            st.success("The lab check settles this sample." + (" The band set contained the true band." if row.covered
+                                                              else " The band set did not contain the true band."))
+
+    queue = st.session_state.get("queue", [])
+    if queue:
+        st.divider()
+        st.subheader("Lab queue, this session")
+        cap = st.number_input("Lab capacity (checks per week)", 1, 500, 10)
+        q = pd.DataFrame(queue).sort_values(["lane", "p_must_catch"], ascending=[True, False])  # HOLD before LAB
+        if len(q) > cap:
+            st.error(f"⚠ {len(q)} samples are queued and the lab takes {cap}. The screen is sending more than the lab can check.")
+        st.dataframe(q.rename(columns={"p_must_catch": f"P(level ≥ {MUST}%)"}), hide_index=True, width="stretch",
+                     column_config={f"P(level ≥ {MUST}%)": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+
+
+# ---------------------------------------------------------------- Evidence
+def tab_radar():
+    rd = R["radar"]
+    st.markdown("Each adulterant-and-level **cell** holds 50 sample IDs. They are repeat measurements of one prepared "
+                "material, so treating them as 50 independent samples is what field statistics calls *pseudoreplication* "
+                "(Hurlbert 1984).")
+    a, b, c = st.columns(3)
+    a.metric("Sample IDs", f"{R['load_audit']['n_samples']:,}")
+    b.metric("Distinct photos", f"{rd['counts'][0]['distinct']:,}")
+    c.metric("Independent cells", R["load_audit"]["n_cells"])
+    t = pd.DataFrame(rd["counts"])
+    t["Strictest count"] = [f"{int(n)} {w}" if isinstance(w, str) else "same as cells" for n, w in zip(t.strict.fillna(0), t.strict_what)]
+    t["Distinct measurements"] = [f"{n:,} {w}" for n, w in zip(t.distinct, t.distinct_what)]
+    st.dataframe(t.rename(columns={"sensor": "Sensor", "nominal": "Sample IDs", "cells": "Cells"})[
+        ["Sensor", "Sample IDs", "Distinct measurements", "Cells", "Strictest count"]], hide_index=True, width="stretch")
+
+    st.subheader("1 · The same photo under several sample IDs")
+    tp = rd["photos"]["twin_pair"]
+    cols = st.columns([1, 1, 1.4])
+    for col, sid in zip(cols, tp["pair"]):
+        col.image(str(C.THUMBS / f"{sid}.jpg"), caption=f"{cell_name(sid)} · sample {sid}")
+    cols[2].markdown(
+        f"These two files differ by **{tp['mean_abs_pixel_difference']:.1f}** grey levels per pixel on average. The same "
+        f"photo is stored under **{tp['size']}** sample IDs for {cell_name(tp['group'].split('-')[0])}.\n\n"
+        f"Across the dataset the median cell holds {rd['photos']['distinct_per_cell_median']:.0f} distinct photos out of 50, "
+        f"and the smallest holds {rd['photos']['distinct_per_cell_min']}.")
+
+    open_cells = sorted(S.cell[~S.locked].unique(), key=lambda c: (c[1], int(c[2:])))
+    cell = st.selectbox("Material to inspect", open_cells, index=open_cells.index("CW6"), format_func=cell_name)
+    name = cell_name(cell)
+    rows = np.flatnonzero((S.cell == cell).to_numpy())
+
+    st.subheader("2 · Fifty spectra from one cell")
+    f = rd["ftir"]
+    gap = np.full((len(rows), 1), np.nan)  # one trace, with a break between spectra
+    fig = go.Figure(go.Scatter(x=np.hstack([np.tile(D.wavenumbers, (len(rows), 1)), gap]).ravel(),
+                               y=np.hstack([SPECTRA.raw[rows], gap]).ravel(), mode="lines",
+                               line=dict(color="#2a78d6", width=1), opacity=0.3, hoverinfo="skip"))
+    chart(fig, 300, title=f"{name}: absorbance of all 50 stored spectra, overlaid",
+          xaxis=dict(title="Wavenumber (cm⁻¹)", autorange="reversed"), yaxis=dict(title="Absorbance"))
+    groups = "; ".join(f"{C.FOLDER_LABEL[k]}: " + ", ".join("–".join(map(str, (g[0], g[-1]))) + "%" if len(g) > 1 else f"{g[0]}%"
+                                                          for g in v["groups"] if len(g) > 1)
+                       for k, v in f["blocks"].items() if any(len(g) > 1 for g in v["groups"]))
+    st.markdown(
+        f"Inside a cell the spectra differ by a standard deviation of **{f['within_cell_sd']:.4f}**, against "
+        f"**{f['between_cell_sd']:.4f}** between cells, and the differences are uncorrelated from one wavenumber to the next "
+        f"(lag-1 autocorrelation {f['residual_lag1_autocorrelation']:.3f}): one spectrum per cell plus noise.\n\n"
+        f"Some cells also share a mean spectrum, leaving **{f['distinct_mean_spectra']}** distinct mean spectra across the "
+        f"39 cells. Levels that share one: {groups}.")
+
+    st.subheader("3 · When the cell's photos were taken")
+    t = S.shot_time.iloc[rows]
+    span = (t.max() - t.min()).total_seconds()
+    n = t.value_counts().sort_index()
+    fig = go.Figure(go.Scatter(x=n.index, y=[0] * len(n), mode="markers+text", text=[f"{k} IDs" for k in n],
+                               textposition="top center", cliponaxis=False,
+                               marker=dict(size=8 + 3 * np.sqrt(n.to_numpy()), color="#2a78d6"),
+                               hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{text}<extra></extra>"))
+    chart(fig, 170, title=f"{name}: {len(n)} distinct photo timestamps for 50 sample IDs, " +
+          (f"{span:.0f} seconds apart at most" if span < 3600 else "spread over more than one sitting"),
+          yaxis=dict(visible=False, range=[-1, 1.6]), xaxis=dict(tickformat="%H:%M:%S"))
+    st.caption(f"Median span across all cells: {rd['photos']['cell_shoot_span_seconds_median']:.0f} seconds. Photo days line up "
+               "with folders: " + "; ".join(f"{C.FOLDER_LABEL[k]} {', '.join(v)}" for k, v in rd["photos"]["sessions_by_folder"].items()) + ".")
+
+
+def tab_ladder():
+    fl = R["floor"]
+    st.markdown("One fixed model per sensor set, scored on four splits of rising strictness. Only the split changes.")
+    st.caption(f"Floor: always answering “adulterated” scores {pct(fl['always_adulterated_plain_accuracy_all_39_cells'])} plain "
+               "accuracy and 50% balanced accuracy, so plain accuracy is never reported. Scores are on the 30 open cells.")
+    rows = pd.DataFrame(R["rows"]).query("section == 'ladder'")
+    titles = {"detect": "Detect (0% against blend): balanced accuracy", "band": "Band (4 classes): macro-F1",
+              "level": "Level: mean absolute error, % points (lower is better)", "type": "Filler type (blends only): macro-F1"}
+    cols = st.columns(2) + st.columns(2)
+    for col, task in zip(cols, C.TASKS):
+        p = rows[(rows.task == task) & (rows.metric == HEADLINE[task])].pivot(index="sensor_set", columns="rung", values="value")
+        p = p.reindex(index=list(C.SENSOR_SETS), columns=C.RUNGS)
+        text = [["n/a" if np.isnan(v) else (f"{v:.1f}" if task == "level" else f"{v:.2f}") for v in r] for r in p.to_numpy()]
+        fig = go.Figure(go.Heatmap(z=p.to_numpy(), x=[C.RUNG_LABEL[r].replace(" · ", "<br>").replace("leave-one-", "leave-") for r in p.columns], y=[SET_LABEL[i] for i in p.index],
+                                   text=text, texttemplate="%{text}", colorscale=SEQ, showscale=False, xgap=2, ygap=2,
+                                   zmin=0, zmax=None if task == "level" else 1,
+                                   hovertemplate="%{y}<br>%{x}<br>%{text}<extra></extra>"))
+        with col:
+            chart(fig, 330, title=titles[task], yaxis=dict(autorange="reversed"), xaxis=dict(side="bottom", tickangle=0, title="Split rung"))
+    st.caption("Rung 4 is a new-folder test: filler, photo session and cinnamon source change together, so it is not an "
+               "unseen-filler result. Filler type has no rung 4 because the held-out filler is never in training. "
+               "Rung 3 still leaks for Walnut shell and Wood dust FTIR, where neighbouring levels share one mean spectrum.")
+
+
+def tab_licence():
+    lic, cl = RES.licence, RES.claims
+    unit = lic["unit"]
+    if lic["licensed"]:
+        st.success(f"✓ PASS is licensed: both claims are certified at or above {pct(BAR, 0)}, counting {unit}.")
+    else:
+        st.error(f"⚠ PASS is locked: counting {unit}, the catch claim is certified at {pct(lic['catch_bound'])} and the "
+                 f"reference claim at {pct(lic['reference_bound'])}. Both must reach {pct(BAR, 0)}.")
+    names = {"catch": f"1 · Catch: blends at or above {MUST}% are not passed",
+             "reference": "2 · Reference: 0% material from a new source is recognised"}
+    t = pd.DataFrame([{
+        "Claim": names[k],
+        "Samples that succeed": f"{v['samples']['k']:,} of {v['samples']['n']:,}",
+        "Certified, counting samples": pct(v["samples"]["bound"]),
+        "Cells that succeed": f"{v['cells']['k']} of {v['cells']['n']}",
+        "Certified, counting cells": pct(v["cells"]["bound"]),
+    } for k, v in cl.items()])
+    st.dataframe(t, hide_index=True, width="stretch")
+    st.caption("Same predictions, two ways of counting. Bounds are one-sided 95% Clopper-Pearson lower bounds on held-out cells: "
+               + ("the 30 open cells under leave-one-cell-out, plus the 9 locked cells." if SCORED else
+                  "the 30 open cells under leave-one-cell-out.")
+               + f" The licence uses the “{unit}” column in this mode. Not a regulatory detection limit.")
+    n2 = cl["reference"]["cells"]["n"]
+    n_cal = int(RES.df.n_units.iloc[0])
+    st.markdown(
+        f"**Built-in limits.** The dataset holds {n2} independent 0% materials. Even if all {n2} were recognised, the "
+        f"reference claim could be certified at no more than **{pct(cp_lower(n2, n2))}**, so in replicate-aware mode PASS "
+        f"stays locked whatever the model does. With {n_cal:,} {UNIT_WORD[MODE]} to calibrate on, α cannot go below "
+        f"**{pct(min_alpha(n_cal))}**" + ("; the chosen α is below that, so every band is kept and every sample goes to the lab."
+                                          if ALPHA < min_alpha(n_cal) else "."))
+
+    st.subheader("What it would take")
+    a, b = st.columns([1, 2])
+    target = a.slider("Target to certify", 0.80, 0.995, float(BAR), 0.005, format="%.3f")
+    a.metric("Independent confirmed lots needed, zero misses", f"{units_needed(target):,}")
+    a.caption("At 95% confidence. " + ", ".join(f"{pct(float(k), 0)}: {v}" for k, v in R["limits"]["lots_needed"].items()) + " lots.")
+
+    held = RES.df[RES.df.level >= MUST]
+    ok = (held.assign(p=held.candidate == "PASS").groupby("cell", sort=False).p.mean() <= 0.05).to_numpy()
+    with b:
+        n = st.slider("Ledger: confirmed held-out cells added", 0, len(ok), len(ok))
+        k_cells = np.cumsum(ok)
+        k_samples = held.assign(s=held.candidate != "PASS").groupby("cell", sort=False).s.sum().cumsum().to_numpy()
+        x = np.arange(1, len(ok) + 1)
+        fig = go.Figure()
+        for name, y, colr in (("counting samples", [cp_lower(int(k), 50 * i) for i, k in zip(x, k_samples)], "#2a78d6"),
+                              ("counting cells", [cp_lower(int(k), int(i)) for i, k in zip(x, k_cells)], "#eb6834")):
+            fig.add_trace(go.Scatter(x=x[:n], y=y[:n], mode="lines+markers", name=name, line=dict(color=colr, width=2),
+                                     marker=dict(size=8), hovertemplate="%{x} cells: %{y:.1%}<extra>" + name + "</extra>"))
+        fig.add_hline(y=BAR, line=dict(color="gray", dash="dot", width=1), annotation_text=f"PASS bar {pct(BAR, 0)}",
+                      annotation_position="bottom left")
+        chart(fig, 330, title="Catch claim: certified bound as held-out cells are confirmed",
+              xaxis=dict(title="Held-out cells confirmed", range=[0.5, len(ok) + 0.5], dtick=2),
+              yaxis=dict(range=[0, 1.05], tickformat=".0%"), legend=dict(orientation="h", y=-0.25))
+    st.caption("The ledger uses the dataset's own held-out cells, in folder and level order. No lots are simulated.")
+
+
+def tab_blind_spot():
+    st.markdown("One tile per adulterant-and-level cell, each judged by a model that never saw it. "
+                "**right**: the screen committed and was correct. **LAB**: it abstained. "
+                "**wrong**: more than 5% of the cell's samples got a wrong PASS candidate or a HOLD on a 0% sample.")
+    t = RES.tiles.set_index(["code", "level"])
+    code_of = {"right": 0, "abstains": 1, "wrong": 2}
+    z, text, hover = [], [], []
+    for code in C.FOLDERS:
+        zr, tr, hr = [], [], []
+        for level in C.LEVELS:
+            if (code, level) in t.index:
+                r = t.loc[(code, level)]
+                zr.append(code_of[r.status])
+                tr.append({"right": "✓ right", "abstains": "⧖ LAB", "wrong": "⚠ wrong"}[r.status])
+                hr.append(f"PASS candidates {r.PASS} · LAB {r.LAB} · HOLD {r.HOLD}")
+            else:
+                zr.append(3)
+                tr.append("locked")
+                hr.append("Locked until the one-time Sunday scoring")
+        z.append(zr)
+        text.append(tr)
+        hover.append(hr)
+    scale = [[0, "#0ca30c"], [0.25, "#0ca30c"], [0.25, "#c3c2b7"], [0.5, "#c3c2b7"], [0.5, "#d03b3b"], [0.75, "#d03b3b"],
+             [0.75, "#f0efec"], [1, "#f0efec"]]
+    fig = go.Figure(go.Heatmap(z=z, x=[f"{l}%" for l in C.LEVELS], y=[C.FOLDER_LABEL[c] for c in C.FOLDERS], text=text,
+                               customdata=hover, texttemplate="%{text}", colorscale=scale, zmin=0, zmax=4, showscale=False,
+                               xgap=3, ygap=3, hovertemplate="%{y} at %{x}<br>%{customdata}<extra></extra>"))
+    chart(fig, 260, title=f"Where the screen is right, abstains or is wrong ({SET_LABEL[SENSORS]}, {decide.MODES[MODE].lower()})",
+          xaxis=dict(type="category", title="Adulteration level (% w/w)"), yaxis=dict(autorange="reversed"))
+    st.caption("PASS candidates are counted before the licence is applied, so the map shows what the model would do if PASS "
+               "were allowed. Hover a tile for its counts.")
+    with st.expander("Table view"):
+        tv = RES.tiles.assign(Filler=RES.tiles.code.map(C.FOLDER_LABEL), Level=RES.tiles.level.astype(str) + "%")
+        st.dataframe(tv[["Filler", "Level", "PASS", "LAB", "HOLD", "wrong", "status"]], hide_index=True, width="stretch")
+
+
+def tab_review():
+    m, b, b1 = RES.metrics, RES.baseline, RES.baseline_sample_split
+    st.markdown("**B1** is the same model forced to call every sample (0% band means PASS, anything else HOLD). "
+                "A wrong auto-decision is a PASS on a blend or a HOLD on a 0% sample.")
+    a, c, d = st.columns(3)
+    a.metric("Wrong auto-decisions, B1 on held-out cells", f"{b['wrong_auto_decisions']:,}")
+    c.metric("Wrong auto-decisions, Earned Pass", f"{m['wrong_auto_decisions']:,}",
+             delta=f"{m['wrong_auto_decisions'] - b['wrong_auto_decisions']:+,} against B1", delta_color="inverse")
+    d.metric("Samples that end in a lab check", pct(1 - m["pass_share"], 0))
+    t = pd.DataFrame({
+        "B1 on the sample-ID split": [f"{b1['wrong_auto_decisions']:,} of {b1['auto_decisions']:,}", pct(1.0, 0),
+                                      pct(b1["wrong_pass_rate"]), pct(b1["wrong_hold_rate"]), pct(b1["stated_confidence"]),
+                                      pct(b1["band_accuracy"]), pct(b1["confidence_gap"])],
+        "B1 on held-out cells": [f"{b['wrong_auto_decisions']:,} of {b['auto_decisions']:,}", pct(1.0, 0),
+                                 pct(b["wrong_pass_rate"]), pct(b["wrong_hold_rate"]), pct(b["stated_confidence"]),
+                                 pct(b["band_accuracy"]), pct(b["confidence_gap"])],
+        "Earned Pass on held-out cells": [f"{m['wrong_auto_decisions']:,} of {m['auto_decisions']:,}", pct(m["coverage"]),
+                                          pct(m["wrong_pass_rate"]), pct(m["wrong_hold_rate"]), pct(m["stated_coverage"]),
+                                          pct(m["set_coverage"]), pct(m["confidence_gap"])],
+    }, index=["Wrong auto-decisions", "Coverage (share decided without abstaining)", "Wrong-PASS rate on blends",
+              "Wrong-HOLD rate on 0% samples", "Stated confidence", "Observed", "Gap between stated and observed"])
+    st.dataframe(t, width="stretch")
+    st.caption("Stated and observed: for B1, the mean top probability against band accuracy; for Earned Pass, 1 − α against "
+               f"the share of band sets that contain the true band. {m['n_samples']:,} held-out samples in {m['n_cells']} cells.")
+
+    st.subheader("Lab capacity")
+    a, c = st.columns(2)
+    weekly = a.number_input("Samples screened per week", 1, 5000, 40)
+    cap = c.number_input("Lab capacity (checks per week)", 0, 5000, 10)
+    need = (1 - m["pass_share"]) * weekly
+    if need > cap:
+        st.error(f"⚠ Stop rule: the screen would send about {need:.0f} of {weekly} samples to the lab and the lab takes {cap}. "
+                 "At these settings the screen has not earned any lab savings.")
+    else:
+        st.success(f"✓ About {need:.0f} of {weekly} samples would go to the lab, within the capacity of {cap}.")
+
+    st.subheader("Cost panel")
+    st.caption("Illustrative assumptions, adjustable. No prices are claimed. Uses the dataset's mix of samples, which is "
+               "not a real intake mix.")
+    a, c = st.columns(2)
+    miss = a.slider("Cost of a wrong PASS, in lab checks", 1, 500, 100)
+    delay = c.slider("Extra cost of a wrong HOLD (delay), in lab checks", 0, 20, 2)
+
+    def cost(pass_share, wrong_pass, wrong_hold, blend_share=0.9):
+        return 100 * ((1 - pass_share) + miss * wrong_pass * blend_share + delay * wrong_hold * (1 - blend_share))
+
+    y = (S.level.to_numpy()[RES.df.row] > 0).mean()
+    p3 = PROBS_BY_SET[SENSORS]
+    held = np.where(RES.df.pool.to_numpy()[:, None] == "dev", p3.p3[RES.df.row], p3.pl[RES.df.row])
+    b_pass_share = float((held.argmax(1) == 0).mean())
+    costs = pd.DataFrame({
+        "Strategy": ["Send everything to the lab", "B1: forced calls", "Earned Pass"],
+        "Cost per 100 samples, in lab checks": [100.0, cost(b_pass_share, b["wrong_pass_rate"], b["wrong_hold_rate"], y),
+                                                cost(m["pass_share"], m["wrong_pass_rate"], m["wrong_hold_rate"], y)],
+    })
+    st.dataframe(costs, hide_index=True, width="stretch", column_config={
+        "Cost per 100 samples, in lab checks": st.column_config.NumberColumn(format="%.0f")})
+
+
+def tab_controls():
+    c = R["controls"]
+    st.subheader("Session probe")
+    sp = c["session_probe"]
+    a, b = st.columns(2)
+    a.metric("Photo features predict the shoot day", pct(sp["session"]["balanced_accuracy"]),
+             help=f"Balanced accuracy over {sp['session']['classes']} days; chance is {pct(sp['session']['chance'])}.")
+    b.metric("Photo features predict the filler", pct(sp["filler"]["balanced_accuracy"]),
+             help=f"Balanced accuracy over {sp['filler']['classes']} fillers; chance is {pct(sp['filler']['chance'])}.")
+    st.caption(f"Twin-aware split. Chance is {pct(sp['session']['chance'])} for the day and {pct(sp['filler']['chance'])} for "
+               "the filler. Photo days line up with folders and levels, so a photo score may be reading the session.")
+
+    st.subheader("Zero-filler probe")
+    z = pd.DataFrame(c["zero_filler_probe"]).T
+    z.index = [SET_LABEL[i] for i in z.index]
+    st.dataframe(z[["own_folder_share"]].rename(columns={"own_folder_share": "0% samples given their own folder's filler"}),
+                 width="stretch", column_config={"0% samples given their own folder's filler":
+                                                 st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+    st.caption("The filler-type model is trained on blends and applied to the 150 0% samples, which contain no filler. "
+               "Chance is 33%. A share well above that means the model reads the folder, not the filler.")
+
+    st.subheader("Offset test")
+    o = c["offset_test"]
+    t = pd.DataFrame([{"Filler": C.FOLDER_LABEL[k], "Split": C.RUNG_LABEL[r], "Raw absorbance": v["raw"],
+                       "First derivative": v["derivative"]} for k, rungs in o.items() for r, v in rungs.items()])
+    st.dataframe(t, hide_index=True, width="stretch", column_config={
+        k: st.column_config.NumberColumn(format="%.2f") for k in ("Raw absorbance", "First derivative")})
+    st.caption("FTIR level error in % points (PLS, 8 components). A first derivative removes a flat offset, so a large rise "
+               "means the dose signal was mostly a baseline shift.")
+
+    st.subheader("Band check")
+    band = st.selectbox("Wavenumber (cm⁻¹)", list(c["band_check"]))
+    fig = go.Figure()
+    for code, vals in c["band_check"][band].items():
+        fig.add_trace(go.Scatter(x=[int(k) for k in vals], y=list(vals.values()), mode="lines+markers", name=C.FOLDER_LABEL[code],
+                                 line=dict(color=FILLER_COLOUR[code], width=2), marker=dict(size=8),
+                                 hovertemplate="%{x}%: %{y:.4f}<extra>" + C.FOLDER_LABEL[code] + "</extra>"))
+    chart(fig, 330, title=f"Cell-mean absorbance at {band} cm⁻¹ against level (open cells)",
+          xaxis=dict(title="Adulteration level (% w/w)"), yaxis=dict(title="Absorbance"), legend=dict(orientation="h", y=-0.3))
+    st.caption("FTIR values are assumed to be transmittance and converted with −log10.")
+
+
+def page_evidence():
+    st.title("Evidence")
+    st.caption(f"{decide.MODES[MODE]} · sensors: {SET_LABEL[SENSORS]} · must-catch {MUST}% · α {ALPHA:.2f} · PASS bar {pct(BAR, 0)}. "
+               "Change these in the sidebar.")
+    tabs = st.tabs(["Replicate Radar", "Stress ladder", "PASS licence", "Blind-spot map", "Review lane vs forced calls", "Controls"])
+    for tab, fn in zip(tabs, (tab_radar, tab_ladder, tab_licence, tab_blind_spot, tab_review, tab_controls)):
+        with tab:
+            fn()
+
+
+# ---------------------------------------------------------------- Log
+def page_log():
+    st.title("Decision log")
+    st.caption("One row per recorded decision. The inspector answers for the record; the tool only recommends.")
+    if not LOG.exists():
+        st.info("No decisions recorded yet. Record one on the Inspect page.")
+        return
+    log = pd.read_csv(LOG)
+    a, b, c = st.columns(3)
+    a.metric("Decisions", len(log))
+    b.metric("Overrides", int(log.override.sum()))
+    c.metric("Sent to lab", int(log.sent_to_lab.sum()))
+    log.insert(2, "material", log.sample_id.map(cell_name))
+    st.dataframe(log.iloc[::-1], hide_index=True, width="stretch")
+    st.download_button("Download CSV", LOG.read_bytes(), "earned_pass_decision_log.csv", "text/csv")
+
+
+st.navigation([
+    st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
+    st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
+    st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"),
+]).run()

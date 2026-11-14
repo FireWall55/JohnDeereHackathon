@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# heavy, rebuilt by `python -m earnedpass.run_all`
+artifacts/*
+!artifacts/results.json
