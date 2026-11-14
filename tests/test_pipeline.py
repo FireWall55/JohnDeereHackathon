@@ -49,6 +49,30 @@ def test_pipeline_with_locked_scoring():
     assert not summary[C.SCREEN_SET]["replicate_aware"]["licence"]["licensed"]  # three 0% cells cap claim 2 at 36.8%
 
 
+def test_type_probabilities_cover_held_out_samples_only():
+    d = synthetic(reps=6)
+    sp = models.Spectra(d.X_ftir)
+    locked = d.samples.locked.to_numpy()
+    t3, tl = run_all.type_probabilities(d, sp)
+    assert t3.shape == (len(C.SENSOR_SETS), len(d.samples), 3)
+    assert np.allclose(t3[:, ~locked].sum(-1), 1)  # 0% samples get a filler guess too
+    assert np.isnan(t3[:, locked]).all() and np.isnan(tl).all()  # locked cells untouched
+    _, tl = run_all.type_probabilities(d, sp, score_locked=True)
+    assert np.allclose(tl[:, locked].sum(-1), 1) and np.isnan(tl[:, ~locked]).all()
+
+
+def test_level_estimates_cover_held_out_samples_only():
+    d = synthetic(reps=6)
+    sp = models.Spectra(d.X_ftir)
+    locked = d.samples.locked.to_numpy()
+    e3, el = run_all.level_estimates(d, sp)
+    assert e3.shape == (len(C.SENSOR_SETS), len(d.samples))
+    assert np.isfinite(e3[:, ~locked]).all() and np.isnan(e3[:, locked]).all() and np.isnan(el).all()
+    assert e3[:, ~locked].min() >= 0 and e3[:, ~locked].max() <= 24
+    _, el = run_all.level_estimates(d, sp, score_locked=True)
+    assert np.isfinite(el[:, locked]).all() and np.isnan(el[:, ~locked]).all()
+
+
 def test_unscored_locked_pool_is_refused():
     d = synthetic(reps=6)
     rows, p1, p3, pl = run_all.model_all(d, models.Spectra(d.X_ftir), log=lambda *_: None)

@@ -15,13 +15,14 @@ import subprocess
 
 import numpy as np
 
-from . import audit, controls, data as data_mod, decide, models
+from . import audit, controls, data as data_mod, decide, models, reference
 from . import config as C
-from .eval import ladder
+from .eval import ladder, splits
 from .eval.bounds import cp_lower, units_needed
 from .eval.conformal import min_alpha
 
 PROBS = C.ARTIFACTS / "band_probs.npz"
+PROBS_REF = C.ARTIFACTS / "band_probs_reference.npz"
 RESULTS = C.ARTIFACTS / "results.json"
 
 
@@ -95,6 +96,49 @@ def model_all(d, spectra, score_locked=False, log=print):
     return rows, p1, p3, pl
 
 
+def type_probabilities(d, spectra, score_locked=False):
+    """Filler-type probabilities for every held-out sample, 0% samples included.
+
+    The type model is fitted on blends only, so it always names one of the three
+    fillers. t3: each open cell judged by the model that never saw it. tl: the
+    locked cells, judged by the model trained on the open cells (NaN until scored).
+    """
+    s, dev, locked = d.samples, d.dev, d.locked
+    sets = list(C.SENSOR_SETS)
+    t3 = np.full((len(sets), len(s), len(C.FOLDERS)), np.nan)
+    tl = np.full_like(t3, np.nan)
+    for _, tr, te in splits.folds(s, "3_leave_cell_out", dev):
+        blocks = models.FoldBlocks(d, spectra, tr)
+        for i, ss in enumerate(sets):
+            t3[i][te] = models.fit_predict(d, blocks, "type", ss, tr, te)[1]
+    if score_locked:
+        blocks = models.FoldBlocks(d, spectra, dev)
+        for i, ss in enumerate(sets):
+            tl[i][locked] = models.fit_predict(d, blocks, "type", ss, dev, locked)[1]
+    return t3, tl
+
+
+def level_estimates(d, spectra, score_locked=False):
+    """Estimated filler level (% w/w) for every held-out sample.
+
+    e3: each open cell estimated by the model that never saw it (leave-one-cell-out).
+    el: the locked cells, by the model trained on the open cells (NaN until scored).
+    """
+    s, dev, locked = d.samples, d.dev, d.locked
+    sets = list(C.SENSOR_SETS)
+    e3 = np.full((len(sets), len(s)), np.nan)
+    el = np.full_like(e3, np.nan)
+    for _, tr, te in splits.folds(s, "3_leave_cell_out", dev):
+        blocks = models.FoldBlocks(d, spectra, tr)
+        for i, ss in enumerate(sets):
+            e3[i][te] = models.fit_predict(d, blocks, "level", ss, tr, te)[0]
+    if score_locked:
+        blocks = models.FoldBlocks(d, spectra, dev)
+        for i, ss in enumerate(sets):
+            el[i][locked] = models.fit_predict(d, blocks, "level", ss, dev, locked)[0]
+    return np.clip(e3, 0, 24), np.clip(el, 0, 24)
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--score-locked", action="store_true", help="score the 9 locked cells (levels 3, 10, 18). Do this once.")
@@ -115,10 +159,33 @@ def main(argv=None) -> None:
     rows, p1, p3, pl = model_all(d, spectra, score_locked=bool(args.score_locked or was_scored))
     locked_scored_at = (was_scored or dt.datetime.now().isoformat(timespec="seconds")) if (args.score_locked or was_scored) else None
     sets = list(C.SENSOR_SETS)
-    np.savez_compressed(PROBS, sets=np.array(sets), p1=p1, p3=p3, pl=pl)
+    print("filler-type predictions for held-out samples...")
+    t3, tl = type_probabilities(d, spectra, score_locked=bool(args.score_locked or was_scored))
+    print("filler-level estimates for held-out samples...")
+    e3, el = level_estimates(d, spectra, score_locked=bool(args.score_locked or was_scored))
+    np.savez_compressed(PROBS, sets=np.array(sets), p1=p1, p3=p3, pl=pl, t3=t3, tl=tl, e3=e3, el=el)
 
     print("lanes, licence and blind-spot map...")
     decision = decision_summary(s, rows, {ss: decide.Probs(p1[i], p3[i], pl[i]) for i, ss in enumerate(sets)})
+
+    print("supplier-reference mode...")
+    ref = reference.run(d, spectra, score_locked=bool(args.score_locked or was_scored))
+    np.savez_compressed(PROBS_REF, sets=np.array(sets), **{k: ref[k] for k in ("p1", "p3", "pl", "t3", "tl", "e3", "el", "is_ref")})
+    ref_rows = []
+    ref_decision = decision_summary(s, ref_rows, {ss: decide.Probs(ref["p1"][i], ref["p3"][i], ref["pl"][i])
+                                                   for i, ss in enumerate(sets)})
+    for r in ref_rows:
+        r["section"] = "reference_decision"
+    rows += ref_rows
+    reference_summary = {
+        "decision": ref_decision,
+        "new_supplier": ref["new_supplier"],
+        "split": {"reference_samples": {c: int((ref["is_ref"] & (s.code == c).to_numpy()).sum()) for c in C.FOLDERS},
+                  "screened_pure_samples": {c: int((~ref["is_ref"] & (s.code == c).to_numpy() & (s.level == 0).to_numpy()).sum())
+                                            for c in C.FOLDERS}},
+        "caveat": "The reference half and the screened pure half come from the same batch, so pure-cinnamon results "
+                  "measure 'same powder as the reference', not a new pure delivery from that supplier.",
+    }
 
     print("controls and Replicate Radar...")
     ctrl = {
@@ -161,6 +228,7 @@ def main(argv=None) -> None:
         "radar": radar,
         "controls": ctrl,
         "decision": decision,
+        "reference": reference_summary,
         "rows": rows,
     }
     RESULTS.write_text(json.dumps(out, indent=1, default=float))

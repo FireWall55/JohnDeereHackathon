@@ -16,12 +16,12 @@ import streamlit as st
 
 from earnedpass import config as C
 from earnedpass import data as data_mod
-from earnedpass import decide, models
+from earnedpass import decide, models, scoreboard
 from earnedpass.eval.bounds import cp_lower, units_needed
 from earnedpass.eval.conformal import min_alpha
 from earnedpass.eval.ladder import HEADLINE
 from earnedpass.features import color
-from earnedpass.run_all import PROBS, RESULTS
+from earnedpass.run_all import PROBS, PROBS_REF, RESULTS
 
 LOG = C.ARTIFACTS / "decision_log.csv"
 LOG_COLUMNS = ["time", "sample_id", "model_version", "mode", "must_catch", "alpha", "pass_bar", "sensors",
@@ -43,19 +43,31 @@ st.set_page_config(page_title="Earned Pass", page_icon="🧪", layout="wide")
 
 
 # ---------------------------------------------------------------- loading
-@st.cache_resource(show_spinner="Loading artifacts...")
+def _read(path):
+    z = np.load(path)
+    probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i]) for i, ss in enumerate(z["sets"])}
+    types = {ss: (z["t3"][i], z["tl"][i]) for i, ss in enumerate(z["sets"])} if "t3" in z else None
+    levels = {ss: (z["e3"][i], z["el"][i]) for i, ss in enumerate(z["sets"])} if "e3" in z else None
+    is_ref = z["is_ref"] if "is_ref" in z else None
+    return probs, types, levels, is_ref
+
+
 def load(_stamp):
     d = data_mod.get()
     results = json.loads(RESULTS.read_text())
-    z = np.load(PROBS)
-    probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i]) for i, ss in enumerate(z["sets"])}
-    return d, results, probs, models.Spectra(d.X_ftir)
+    art = {"general": _read(PROBS)}
+    if PROBS_REF.exists() and "reference" in results:
+        art["supplier"] = _read(PROBS_REF)
+    return d, results, art, models.Spectra(d.X_ftir)
+
+
+load = st.cache_resource(show_spinner="Loading artifacts...")(load)
 
 
 @st.cache_resource(show_spinner=False)
-def evaluate(_stamp, mode, alpha, must_catch, bar, sensor_set):
-    d, _, probs, _ = load(_stamp)
-    return decide.evaluate(d.samples, probs[sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
+def evaluate(_stamp, ref, mode, alpha, must_catch, bar, sensor_set):
+    d, _, art, _ = load(_stamp)
+    return decide.evaluate(d.samples, art[ref][0][sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
 
 
 if not (RESULTS.exists() and PROBS.exists()):
@@ -64,31 +76,71 @@ if not (RESULTS.exists() and PROBS.exists()):
     st.stop()
 
 STAMP = RESULTS.stat().st_mtime
-D, R, PROBS_BY_SET, SPECTRA = load(STAMP)
+D, R, ART, SPECTRA = load(STAMP)
 S = D.samples
 SCORED = bool(R["meta"]["locked_scored_at"])
 
+MODE_LABEL = {"replicate_aware": "Careful: count each material once", "as_labelled": "Trusting: count every sample"}
+BAND_NAME = {"zero": "none (0%)", "low": "low (1–4%)", "mid": "medium (6–12%)", "high": "high (15–24%)"}
+
 with st.sidebar:
-    st.header("Qualification")
-    st.caption("Set by the QC manager before go-live. Defaults are illustrative, not regulatory limits.")
-    MODE = st.radio("How evidence is counted", list(decide.MODES), index=1, format_func=decide.MODES.get,
-                    help="As labelled: all 50 sample IDs in a cell count as independent. Replicate-aware: the 50 are "
-                         "repeat measurements of one adulterant at one level, so the cell counts once.")
-    MUST = st.select_slider("Must-catch level (% w/w)", decide.MUST_CATCH_OPTIONS, value=C.MUST_CATCH,
-                            help="Blends at or above this level must never be passed. Sits on a band edge.")
-    ALPHA = st.slider("Band-set miss rate α", 0.02, 0.30, C.ALPHA, 0.01,
-                      help="The band set should contain the true band in at least 1 − α of cases.")
-    BAR = st.slider("PASS bar", 0.50, 0.99, C.PASS_BAR, 0.01, help="Both PASS claims must be certified at or above this.")
-    SENSORS = st.selectbox("Screen sensors", list(C.SENSOR_SETS), index=list(C.SENSOR_SETS).index(C.SCREEN_SET),
+    st.header("Screen settings")
+    st.caption("A QC manager sets these once, before the screen is used. The starting values are examples, not legal limits.")
+    EXPLAIN = st.toggle("Explain each setting", True)
+
+    def note(text):
+        if EXPLAIN:
+            st.caption(text)
+
+    REF_LABEL = {"general": "Pure cinnamon in general", "supplier": "The supplier's own reference sample"}
+    REF = st.radio("Compare each sample with", [k for k in REF_LABEL if k in ART], format_func=REF_LABEL.get,
+                   help="Supplier reference: each folder stands in for one supplier, and half of its pure batch is "
+                        "kept as that supplier's retained reference sample.")
+    note("**In general** asks “does this look like pure cinnamon?”, learned from three pure batches that look different "
+         "from each other. **Supplier reference** asks “how different is this from the pure sample this supplier gave "
+         "us?”, which is how a receiving inspector usually checks.")
+    if REF == "supplier":
+        st.caption("⚠️ The reference and the pure samples it is tested on come from the same batch, so its results on "
+                   "pure cinnamon are optimistic.")
+
+    MODE = st.radio("How to count repeated measurements", list(MODE_LABEL), format_func=MODE_LABEL.get,
+                    help="Technical names: replicate-aware and as labelled. A material (one filler at one level) is called a cell.")
+    note("Every material in the dataset was measured 50 times. **Careful** treats those 50 as one piece of evidence, because "
+         "they are repeats of the same powder. **Trusting** treats them as 50, which makes the screen look better proven "
+         "than it is.")
+
+    MUST = st.select_slider("Smallest adulteration that must never slip through", decide.MUST_CATCH_OPTIONS,
+                            value=C.MUST_CATCH, format_func=lambda v: f"{v}% filler",
+                            help="Technical name: must-catch level, in % by weight.")
+    note("A sample gets **HOLD** only when the screen is sure it contains at least this much filler. "
+         "Slide left to be stricter: more samples are held.")
+
+    CONF = st.slider("How sure the screen must be", 70, 98, int(round((1 - C.ALPHA) * 100)), 1, format="%d%%",
+                     help="Technical name: 1 − α, the coverage of the conformal band set.")
+    ALPHA = round(1 - CONF / 100, 2)
+    note(f"The screen keeps a shortlist of adulteration ranges it cannot rule out. At {CONF}%, the true range should be on "
+         f"that shortlist about {CONF} times in 100. Slide right to be more cautious: longer shortlists, more samples "
+         "sent to the lab.")
+
+    BAR = st.slider("Proof needed before PASS is allowed", 50, 99, int(round(C.PASS_BAR * 100)), 1, format="%d%%",
+                    help="Technical name: PASS bar. Both PASS claims need a certified lower bound at or above it.") / 100
+    note("PASS lets a sample skip the lab, so it has to be earned. The screen may only say PASS once its track record on "
+         "materials it has never seen is proven to at least this level. Slide right to make PASS harder to earn.")
+
+    SENSORS = st.selectbox("Instruments used for screening", list(C.SENSOR_SETS), index=list(C.SENSOR_SETS).index(C.SCREEN_SET),
                            format_func=SET_LABEL.get)
-    USER = st.text_input("Inspector", "inspector-1")
+    note("A colorimeter and a camera are what an inspector has at the receiving dock. FTIR is a lab instrument.")
+
+    USER = st.text_input("Your name", "inspector-1")
+    note("Written into the decision log next to every decision you record.")
     st.divider()
     st.caption("The tool recommends; the inspector decides.")
     st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"] if SCORED
                else "locked cells (levels 3, 10, 18) not scored yet"))
 
-RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, SENSORS)
-LAB_RES = evaluate(STAMP, MODE, ALPHA, MUST, BAR, C.LAB_SET)
+PROBS_BY_SET, TYPES, LEVEL_EST, IS_REF = ART[REF]
+RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, SENSORS)
+LAB_RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, C.LAB_SET)
 
 
 def pct(x, digits=1):
@@ -106,7 +158,7 @@ def lane_card(lane, body):
         f"""<div style="border-left:6px solid {m['colour']};padding:.6rem 1rem;border-radius:6px;
         background:color-mix(in srgb,{m['colour']} 9%,transparent)">
         <div style="font-size:1.9rem;font-weight:700;line-height:1.2">{m['icon']} {lane}</div>
-        <div style="opacity:.8;margin-bottom:.4rem">{m['text']}</div><div>{body}</div></div>""",
+        <div style="opacity:.8">{m['text']}</div><div>{body}</div></div>""",
         unsafe_allow_html=True,
     )
 
@@ -123,79 +175,184 @@ def describe(sample) -> str:
     return f"{sample.sample_id}: {C.FOLDER_LABEL[sample.code]}, {sample.level}% w/w"
 
 
+def pass_status():
+    """Plain-language banner: is PASS available, and if not, why."""
+    lic, cl = RES.licence, RES.claims
+    unit = lic["unit"]
+    if lic["licensed"]:
+        st.success(f"✓ **PASS is available.** The screen has proven both of its PASS promises to at least {pct(BAR, 0)}."
+                   + (" The pure-cinnamon promise was tested on the same batch as the supplier's reference, so treat it "
+                      "as optimistic." if REF == "supplier" else ""))
+        return
+    ref, catch = cl["reference"][unit], cl["catch"][unit]
+    what = "samples" if unit == "samples" else "materials"
+    st.warning(
+        f"🔒 **PASS is switched off at these settings, so no sample will get it.** PASS lets a sample skip the lab, so the "
+        f"screen must first prove two promises on materials it has never seen, each to at least {pct(BAR, 0)}:\n\n"
+        f"1. *It never passes a sample with {MUST}% filler or more.* It kept this for {catch['k']:,} of {catch['n']:,} "
+        f"{what}, which proves **{pct(catch['bound'])}**. {'✓' if catch['bound'] >= BAR else '✗'}\n"
+        f"2. *It recognises a batch of pure cinnamon it has not seen before.* It managed this for {ref['k']:,} of "
+        f"{ref['n']:,} {what}, which proves **{pct(ref['bound'])}**. {'✓' if ref['bound'] >= BAR else '✗'}\n\n"
+        + ("The dataset has only three batches of pure cinnamon and they look different from each other, so pure cinnamon "
+           "from a new batch looks adulterated to the screen. Until that is fixed with more pure-cinnamon evidence, every "
+           "sample goes to **LAB** or **HOLD**." if REF == "general" else
+           "Comparing with the supplier's reference helps, but there are still only three suppliers' pure batches to "
+           "learn from, and careful counting treats each as one piece of evidence.")
+        + " See Evidence → PASS licence for the numbers.")
+
+
+FILLER_SURE = 0.80  # below this the screen says it cannot tell which filler
+
+
+def filler_guess(cur, pool, row):
+    """Which of the three known fillers the screen thinks is in the sample."""
+    if TYPES is None:
+        st.caption("Filler type is not available yet. Run `python -m earnedpass.run_all` once to add it.")
+        return
+    t3, tl = TYPES[SENSORS]
+    p = (tl if pool == "locked" else t3)[cur]
+    codes = list(C.FOLDERS)
+    top = int(np.argmax(p))
+    blends = D.dev[(S.level.to_numpy()[D.dev] > 0) & np.isfinite(t3[D.dev]).all(1)]
+    hit = float((t3[blends].argmax(1) == S.code.iloc[blends].map(codes.index).to_numpy()).mean())
+    lead = "**If there is filler, most likely:**" if row.in_zero else "**Likely filler:**"
+    if row.candidate == "PASS":
+        st.markdown("**Likely filler:** none suspected")
+    elif p[top] < FILLER_SURE:
+        st.markdown("**Likely filler:** cannot tell which. " + ", ".join(f"{C.FOLDER_LABEL[c]} {pct(v, 0)}" for c, v in zip(codes, p)))
+    else:
+        nut = " Possible nut-shell material: confirm at the lab." if codes[top] in ("P", "W") else ""
+        st.markdown(f"{lead} {C.FOLDER_LABEL[codes[top]]} (model {pct(p[top], 0)}).{nut}")
+    with st.popover("How far to trust the filler guess"):
+        st.markdown(
+            f"- The screen only knows three fillers: peanut shell, walnut shell and wood dust. It always picks among them, "
+            "so a filler it has never seen would be given one of these names.\n"
+            f"- On blends it had not seen, these instruments named the right filler for **{pct(hit)}** of samples.\n"
+            "- In this dataset each filler was prepared and photographed in its own batch, on its own days. The guess may "
+            "partly be recognising the batch, not the filler.\n"
+            "- It has no answer for “no filler”. If the screen flags pure cinnamon by mistake, it will still name a filler "
+            "(see Evidence → Controls → Zero-filler probe).\n"
+            "- It says nothing about allergens. Allergen content is not measured.")
+
+
 def append_log(row: dict):
     pd.DataFrame([row], columns=LOG_COLUMNS).to_csv(LOG, mode="a", header=not LOG.exists(), index=False)
 
 
 # ---------------------------------------------------------------- Inspect
+BAND_TOP = {"zero": 0, "low": 4, "mid": 12, "high": 24}
+
+
+def level_estimate(cur, pool):
+    """(estimate in %, margin in points) or None. The margin covers 8 in 10 held-out samples."""
+    if LEVEL_EST is None:
+        return None
+    e3, el = LEVEL_EST[SENSORS]
+    est = float((el if pool == "locked" else e3)[cur])
+    dev = D.dev
+    dev = dev[np.isfinite(e3[dev])]
+    margin = float(np.quantile(np.abs(e3[dev] - S.level.to_numpy()[dev]), 0.8))
+    return est, margin
+
+
+def estimate_text(cur, pool) -> str:
+    le = level_estimate(cur, pool)
+    if le is None:
+        return "not available: run `python -m earnedpass.run_all`"
+    est, m = le
+    lo, hi = max(0, est - m), min(24, est + m)
+    return f"about {est:.0f}%  (likely {lo:.0f}–{hi:.0f}%)"
+
+
+def amount_text(row) -> str:
+    """The filler amount the screen cannot rule out, as one range."""
+    kept = [b for b in C.BANDS if row[f"in_{b}"]]
+    if not kept:
+        return "cannot tell"
+    lo, hi = C.BAND_FLOOR[kept[0]], BAND_TOP[kept[-1]]
+    if hi == 0:
+        return "0% (no filler)"
+    return f"{lo}–{hi}% ({' or '.join('none' if b == 'zero' else BAND_NAME[b].split(' ')[0] for b in kept)})"
+
+
+def truth_checks(cur, pool, row, smp) -> dict:
+    """The dataset's own label for this sample, and how the screen did against it."""
+    truth = "pure cinnamon (0%)" if smp.level == 0 else f"{C.FOLDER_LABEL[smp.code]}, {smp.level}%"
+    if row.lane == "LAB":
+        call = "no call (left to the lab)"
+    elif row.lane == "PASS":
+        call = "✓ right" if smp.level == 0 else "✗ wrong: adulterated sample passed"
+    else:
+        call = "✗ wrong: pure cinnamon held" if smp.level == 0 else "✓ right: it is adulterated"
+    guess = filler_short(cur, pool, row)
+    if TYPES is None or guess == "cannot tell which":
+        filler = "no guess made"
+    elif guess == "none suspected":
+        filler = "✓ right" if smp.level == 0 else "✗ wrong: there is filler"
+    elif smp.level == 0:
+        filler = "there is no filler (the screen had not ruled that out)" if row.in_zero else "✗ wrong: there is no filler"
+    else:
+        filler = "✓ right" if guess.startswith(C.FOLDER_LABEL[smp.code]) else "✗ wrong"
+    out = {"Ground truth": truth, "Recommendation was": call, "Filler guess was": filler}
+    le = level_estimate(cur, pool)
+    if le is not None:
+        est, m = le
+        off = abs(est - smp.level)
+        out["Amount estimate was"] = (f"{'✓' if off <= m else '✗'} off by {off:.0f} points"
+                                      + ("" if off <= m else " (outside its likely range)"))
+    return out
+
+
 def page_inspect():
     st.title("Sample screening")
     pool = "locked" if SCORED else "dev"
     df = RES.df[RES.df.pool == pool].set_index("row")
-    st.caption(
-        ("Samples come from the 9 locked cells, judged by the model trained on the 30 open cells. " if SCORED else
-         "Until the locked cells are scored, samples come from the 30 open cells, each judged by a model that never saw "
-         "its cell. ") + "Lab-prepared blends, three fillers, 0 to 24% w/w. One reading describes one ground sample, not a container."
-    )
-    with st.expander("Demo controls"):
-        cells = ["Any cell"] + sorted(df.cell.unique(), key=lambda c: (c[1], int(c[2:])))
-        pick = st.selectbox("Draw the next sample from", cells, format_func=lambda c: c if c == "Any cell" else cell_name(c),
-                            help="For rehearsing the demo. An inspector would not know this.")
+    pick = st.session_state.get("demo_pick", "Any material")
 
     def draw():
-        choices = df.index[df.cell == pick] if pick != "Any cell" else df.index
+        choices = df.index[df.cell == pick] if pick in set(df.cell) else df.index
         st.session_state.cur = int(np.random.default_rng().choice(choices))
         st.session_state.revealed = None
 
     if st.session_state.get("cur") not in df.index:
         draw()
-    st.button("Next sample", on_click=draw, type="primary")
+    a, b = st.columns([1, 1.5], gap="large", vertical_alignment="center")
+    a.button("Next sample", on_click=draw, type="primary")
+    show_truth = b.toggle("Show ground truth", True, help="The dataset's own label for the sample, and whether the screen "
+                          "got it right. Turn off to screen blind; it then appears after you record a decision.")
 
     cur = st.session_state.cur
     row, smp = df.loc[cur], S.iloc[cur]
     revealed = st.session_state.get("revealed") == cur
+    lab = LAB_RES.df.set_index("row").loc[cur]
 
-    dev = D.dev
-    train = dev[S.cell.to_numpy()[dev] != smp.cell] if pool == "dev" else dev
-    refs = color.references(S, train)
-    own_ref = smp.code in refs
-    dE = float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - refs.get(smp.code, refs[None])))
-
-    left, mid, right = st.columns([1.1, 1, 1.7], gap="large")
+    # ---- first glance: the result, the filler, the amount
+    left, right = st.columns([1, 1.5], gap="large")
     with left:
-        st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d} · sample screened")
-    with mid:
-        st.subheader("Colour reading")
-        a, b = st.columns(2)
-        a.metric("L*", f"{smp.L:.1f}")
-        b.metric("a*", f"{smp.a:.1f}")
-        a.metric("b*", f"{smp.b:.1f}")
-        b.metric("ΔE to reference", f"{dE:.1f}")
-        st.caption("Reference: the retained 0% sample from this source." if own_ref else
-                   "No retained 0% sample from this source is available to the model, so the reference is the average of the other sources.")
+        st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d}")
     with right:
-        lane_card(row.lane, decide.reason(row, RES))
-        kept = [b for b in C.BANDS if row[f"in_{b}"]]
-        st.markdown("**Bands the screen cannot rule out:** " + (" ".join(f"`{b} {C.BAND_RANGE[b]}`" for b in kept) or "none"))
-        st.caption(f"Calibrated on {int(row.n_units):,} {UNIT_WORD[MODE]} · sensors: {SET_LABEL[SENSORS]} · "
-                   f"must-catch {MUST}% · α {ALPHA:.2f}")
-        fig = go.Figure(go.Bar(
-            y=[f"{b} ({C.BAND_RANGE[b]})" + ("  ● kept" if row[f"in_{b}"] else "") for b in C.BANDS][::-1],
-            x=[row[f"p_{b}"] for b in C.BANDS][::-1], orientation="h", marker_color="#2a78d6", width=0.5,
-            text=[pct(row[f"p_{b}"], 0) for b in C.BANDS][::-1], textposition="outside", cliponaxis=False,
-            hovertemplate="%{y}: %{x:.1%}<extra></extra>"))
-        chart(fig, 190, title="Model probability by band", xaxis=dict(range=[0, 1.12], tickformat=".0%", showgrid=False))
+        lane_card(row.lane, "")
+        rows = {"Likely filler": filler_short(cur, pool, row), "Estimated filler amount": estimate_text(cur, pool)}
+        if show_truth or revealed:
+            rows.update(truth_checks(cur, pool, row, smp))
+        else:
+            rows["Ground truth"] = "hidden until you record a decision"
+        rows["Compared with"] = reference_name(smp)
+        rows.update({"L* (lightness)": f"{smp.L:.1f}", "a* (green to red)": f"{smp.a:.1f}", "b* (blue to yellow)": f"{smp.b:.1f}",
+                     "ΔE to its reference": f"{reference_delta(cur, pool):.1f}"})
+        st.dataframe(pd.DataFrame({"This sample": rows}), width="stretch")
+        if not RES.licence["licensed"]:
+            st.caption("🔒 PASS is switched off at these settings. The reason is under “Details and reasoning”.")
 
-    st.divider()
-    st.subheader("Inspector decision")
-    decision = st.radio("Your decision", list(LANE), index=list(LANE).index(row.lane), horizontal=True, key=f"decision{cur}",
-                        format_func=lambda k: f"{LANE[k]['icon']} {k}", disabled=revealed)
-    if decision != row.lane:
-        st.warning(f"This overrides the recommendation ({row.lane}). The override is recorded under your name.")
-    label = "Record decision and release without a lab check" if decision == "PASS" else "Record decision and send to lab"
-    if st.button(label, disabled=revealed):
+    # ---- the inspector's decision
+    a, b = st.columns([1, 1.5], gap="large", vertical_alignment="bottom")
+    decision = a.radio("Your decision", list(LANE), index=list(LANE).index(row.lane), horizontal=True, key=f"decision{cur}",
+                       format_func=lambda k: f"{LANE[k]['icon']} {k}", disabled=revealed)
+    label = "Record and release without a lab check" if decision == "PASS" else "Record and send to lab"
+    if b.button(label, disabled=revealed):
         append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
-                        model_version=R["meta"]["model_version"], mode=MODE, must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
+                        model_version=R["meta"]["model_version"], mode=MODE + ("+supplier_reference" if REF == "supplier" else ""),
+                        must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
                         sensors=SENSORS, recommended=row.lane, decision=decision, override=decision != row.lane,
                         sent_to_lab=decision != "PASS", user=USER))
         if decision != "PASS":
@@ -203,42 +360,92 @@ def page_inspect():
                 dict(sample=f"#{cur:04d}", lane=decision, p_must_catch=float(row.p_must_catch)))
         st.session_state.revealed = cur
         st.rerun()
+    if decision != row.lane and not revealed:
+        st.warning(f"This overrides the recommendation ({row.lane}). The override is recorded under your name.")
 
     if revealed:
-        lab = LAB_RES.df.set_index("row").loc[cur]
-        a, b = st.columns(2)
-        with a:
-            st.markdown("**FTIR lane** (same rules, lab spectrum)")
-            st.markdown(f"Bands not ruled out: `{lab['set']}` · most likely: `{lab.top_band} {C.BAND_RANGE[lab.top_band]}`")
-            st.caption("A model reading of the stored spectrum, not a reference test.")
-        with b:
-            st.markdown("**Dataset label**")
-            st.markdown(describe(smp))
         last = pd.read_csv(LOG).query("sample_id == @smp.sample_id").iloc[-1]
         if last.decision == "PASS" and smp.level > 0:
-            st.error("A blend was released without a lab check. This is the error the PASS licence exists to prevent.")
+            st.error("An adulterated sample was released without a lab check. This is the error the PASS rules exist to prevent.")
         elif last.decision == "HOLD" and smp.level == 0:
-            st.warning("A 0% sample was held: a delay and a lab fee, and the lab check clears it.")
+            st.warning("Pure cinnamon was held: a delay and a lab fee, and the lab check clears it.")
         elif last.decision == "PASS":
-            st.success("A 0% sample was released without a lab check.")
+            st.success("Pure cinnamon was released without a lab check.")
         else:
-            st.success("The lab check settles this sample." + (" The band set contained the true band." if row.covered
-                                                              else " The band set did not contain the true band."))
+            st.success("Sent to the lab, which settles this sample.")
+
+    # ---- everything else, out of the way
+    with st.expander("Details and reasoning"):
+        st.markdown(f"**Why {row.lane}:** {decide.reason(row, RES)}")
+        fig = go.Figure(go.Bar(
+            y=[BAND_NAME[b] + ("  ● not ruled out" if row[f"in_{b}"] else "") for b in C.BANDS][::-1],
+            x=[row[f"p_{b}"] for b in C.BANDS][::-1], orientation="h", marker_color="#2a78d6", width=0.5,
+            text=[pct(row[f"p_{b}"], 0) for b in C.BANDS][::-1], textposition="outside", cliponaxis=False,
+            hovertemplate="%{y}: %{x:.1%}<extra></extra>"))
+        chart(fig, 190, title="How likely each filler level is, according to the model",
+              xaxis=dict(range=[0, 1.12], tickformat=".0%", showgrid=False))
+        st.caption("The model is often very sure and still wrong on materials it has not seen, so the screen keeps every "
+                   "level it cannot rule out, not just the most likely one.")
+        st.markdown(f"**Filler levels the screen cannot rule out:** {amount_text(row)}. This range, not the estimate, "
+                    "decides PASS, LAB or HOLD." + (f" It {'contains' if row.covered else 'does not contain'} the true amount."
+                                                    if show_truth or revealed else ""))
+        le = level_estimate(cur, pool)
+        if le is not None:
+            st.caption(f"The estimated amount comes from a separate model that predicts a single number. On materials it "
+                       f"had not seen, its estimate was within ±{le[1]:.0f} points of the truth for 8 samples in 10. It can "
+                       "disagree with the range above; when it does, trust the range.")
+        filler_guess(cur, pool, row)
+        if revealed:
+            st.markdown(f"**Lab instrument (FTIR) reading of this sample:** cannot rule out `{lab['set']}`, most likely "
+                        f"`{BAND_NAME[lab.top_band]}`. This is a model reading of the stored spectrum, not a reference test. "
+                        f"Dataset label: {describe(smp)}.")
+        pass_status()
+        st.caption(
+            f"Calibrated on {int(row.n_units):,} {UNIT_WORD[MODE]} · instruments: {SET_LABEL[SENSORS]} · must catch {MUST}% "
+            f"or more · {CONF}% sure. " +
+            ("Samples come from the 9 locked cells, judged by the model trained on the 30 open cells. " if SCORED else
+             "Samples come from the 30 open materials, each judged by a model that never saw that material. ") +
+            "Lab-prepared blends, three fillers, 0 to 24% by weight. One reading describes one ground sample, not a container. " +
+            ("ΔE is measured against the supplier's reference sample (half of that folder's pure batch, never screened "
+             "itself). " if REF == "supplier" else "") +
+            "In general mode, ΔE is measured against the pure-cinnamon sample from the same folder when the model may see one, otherwise "
+            "against the average of the other folders.")
+
+    with st.expander("How to read this page"):
+        st.markdown(
+            "1. Press **Next sample**. The screen looks at the photo and the colour reading of one ground sample.\n"
+            "2. It gives one of three recommendations:\n"
+            f"   - {LANE['PASS']['icon']} **PASS**: the sample looks like pure cinnamon *and* the screen has earned the right to say so. No lab check.\n"
+            f"   - {LANE['LAB']['icon']} **LAB**: the screen is not sure. Send the sample for a routine lab check.\n"
+            f"   - {LANE['HOLD']['icon']} **HOLD**: the screen is confident the sample has at least {MUST}% filler. Keep the lot back and test it first.\n"
+            "3. **Likely filler** and **Filler amount** are the screen's best reading of what was added and how much.\n"
+            "4. **Ground truth** is what the dataset says the sample really is, with a check on each thing the screen said. "
+            "Switch it off at the top to screen blind.\n"
+            "5. Choose your own decision and record it.\n\n"
+            "The settings on the left change how cautious the screen is.")
 
     queue = st.session_state.get("queue", [])
-    if queue:
-        st.divider()
-        st.subheader("Lab queue, this session")
-        cap = st.number_input("Lab capacity (checks per week)", 1, 500, 10)
-        q = pd.DataFrame(queue).sort_values(["lane", "p_must_catch"], ascending=[True, False])  # HOLD before LAB
-        if len(q) > cap:
-            st.error(f"⚠ {len(q)} samples are queued and the lab takes {cap}. The screen is sending more than the lab can check.")
-        st.dataframe(q.rename(columns={"p_must_catch": f"P(level ≥ {MUST}%)"}), hide_index=True, width="stretch",
-                     column_config={f"P(level ≥ {MUST}%)": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+    with st.expander(f"Lab queue this session ({len(queue)})"):
+        if not queue:
+            st.caption("Nothing has been sent to the lab yet.")
+        else:
+            cap = st.number_input("Lab capacity (checks per week)", 1, 500, 10)
+            q = pd.DataFrame(queue).sort_values(["lane", "p_must_catch"], ascending=[True, False])  # HOLD before LAB
+            if len(q) > cap:
+                st.error(f"⚠ {len(q)} samples are queued and the lab takes {cap}. The screen is sending more than the lab can check.")
+            st.dataframe(q.rename(columns={"p_must_catch": f"P(level ≥ {MUST}%)"}), hide_index=True, width="stretch",
+                         column_config={f"P(level ≥ {MUST}%)": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+
+    with st.expander("Demo controls"):
+        cells = ["Any material"] + sorted(df.cell.unique(), key=lambda c: (c[1], int(c[2:])))
+        st.selectbox("Draw the next sample from", cells, key="demo_pick",
+                     format_func=lambda c: c if c == "Any material" else cell_name(c),
+                     help="For rehearsing the demo. An inspector would not know this.")
 
 
 # ---------------------------------------------------------------- Evidence
 def tab_radar():
+    st.info('**In plain words:** the dataset looks like 1,950 separate samples, but many are the same powder measured again and again. This tab shows the proof. It matters because a model tested on near-copies of what it trained on will look far better than it is.')
     rd = R["radar"]
     st.markdown("Each adulterant-and-level **cell** holds 50 sample IDs. They are repeat measurements of one prepared "
                 "material, so treating them as 50 independent samples is what field statistics calls *pseudoreplication* "
@@ -303,6 +510,7 @@ def tab_radar():
 
 
 def tab_ladder():
+    st.info('**In plain words:** the same model sits four exams, from easy to fair. In exams 1 and 2 it has already seen near-copies of the test samples. In exam 3 the test material is new, and in exam 4 the whole filler folder is new. Each square is a score (darker is higher). Watch the scores drop from left to right. The bottom-left chart shows error, so there darker is worse.')
     fl = R["floor"]
     st.markdown("One fixed model per sensor set, scored on four splits of rising strictness. Only the split changes.")
     st.caption(f"Floor: always answering “adulterated” scores {pct(fl['always_adulterated_plain_accuracy_all_39_cells'])} plain "
@@ -327,6 +535,7 @@ def tab_ladder():
 
 
 def tab_licence():
+    st.info('**In plain words:** PASS lets a sample skip the lab, so the screen has to earn it. This tab shows the two promises the screen must keep, how well each is proven, and how much more evidence it would take.')
     lic, cl = RES.licence, RES.claims
     unit = lic["unit"]
     if lic["licensed"]:
@@ -354,7 +563,7 @@ def tab_licence():
         f"**Built-in limits.** The dataset holds {n2} independent 0% materials. Even if all {n2} were recognised, the "
         f"reference claim could be certified at no more than **{pct(cp_lower(n2, n2))}**, so in replicate-aware mode PASS "
         f"stays locked whatever the model does. With {n_cal:,} {UNIT_WORD[MODE]} to calibrate on, α cannot go below "
-        f"**{pct(min_alpha(n_cal))}**" + ("; the chosen α is below that, so every band is kept and every sample goes to the lab."
+        f"**{pct(min_alpha(n_cal))}** (so “how sure” tops out at {pct(1 - min_alpha(n_cal), 0)})" + ("; the chosen α is below that, so every band is kept and every sample goes to the lab."
                                           if ALPHA < min_alpha(n_cal) else "."))
 
     st.subheader("What it would take")
@@ -384,6 +593,7 @@ def tab_licence():
 
 
 def tab_blind_spot():
+    st.info('**In plain words:** each square is one material the screen had never seen before. Green means it committed to an answer and was right. Grey means it was not sure and sent the sample to the lab. Red means it was confident and wrong. White squares are set aside for the final test.')
     st.markdown("One tile per adulterant-and-level cell, each judged by a model that never saw it. "
                 "**right**: the screen committed and was correct. **LAB**: it abstained. "
                 "**wrong**: more than 5% of the cell's samples got a wrong PASS candidate or a HOLD on a 0% sample.")
@@ -410,7 +620,7 @@ def tab_blind_spot():
     fig = go.Figure(go.Heatmap(z=z, x=[f"{l}%" for l in C.LEVELS], y=[C.FOLDER_LABEL[c] for c in C.FOLDERS], text=text,
                                customdata=hover, texttemplate="%{text}", colorscale=scale, zmin=0, zmax=4, showscale=False,
                                xgap=3, ygap=3, hovertemplate="%{y} at %{x}<br>%{customdata}<extra></extra>"))
-    chart(fig, 260, title=f"Where the screen is right, abstains or is wrong ({SET_LABEL[SENSORS]}, {decide.MODES[MODE].lower()})",
+    chart(fig, 260, title=f"Where the screen is right, abstains or is wrong ({SET_LABEL[SENSORS]}, {MODE_LABEL[MODE].lower()})",
           xaxis=dict(type="category", title="Adulteration level (% w/w)"), yaxis=dict(autorange="reversed"))
     st.caption("PASS candidates are counted before the licence is applied, so the map shows what the model would do if PASS "
                "were allowed. Hover a tile for its counts.")
@@ -420,6 +630,7 @@ def tab_blind_spot():
 
 
 def tab_review():
+    st.info('**In plain words:** this compares the screen with an ordinary model that must always give an answer. Saying “not sure, send to lab” costs lab checks, but avoids confident mistakes.')
     m, b, b1 = RES.metrics, RES.baseline, RES.baseline_sample_split
     st.markdown("**B1** is the same model forced to call every sample (0% band means PASS, anything else HOLD). "
                 "A wrong auto-decision is a PASS on a blend or a HOLD on a 0% sample.")
@@ -479,6 +690,7 @@ def tab_review():
 
 
 def tab_controls():
+    st.info('**In plain words:** four sanity checks on whether the models learned about the powder itself, or about accidents of how the dataset was made (which day a photo was taken, which folder a file sits in).')
     c = R["controls"]
     st.subheader("Session probe")
     sp = c["session_probe"]
@@ -522,12 +734,241 @@ def tab_controls():
 
 def page_evidence():
     st.title("Evidence")
-    st.caption(f"{decide.MODES[MODE]} · sensors: {SET_LABEL[SENSORS]} · must-catch {MUST}% · α {ALPHA:.2f} · PASS bar {pct(BAR, 0)}. "
-               "Change these in the sidebar.")
+    st.caption(f"Compared with {REF_LABEL[REF].lower()} · {MODE_LABEL[MODE]} · instruments: {SET_LABEL[SENSORS]} · must catch "
+               f"{MUST}% or more · {CONF}% sure · PASS needs {pct(BAR, 0)} proof. Change these in the sidebar.")
+    if REF == "supplier":
+        ns = R["reference"]["new_supplier"][SENSORS]
+        sp = R["reference"]["split"]
+        st.info(
+            "**Supplier-reference mode.** Each folder stands in for one supplier. Half of its pure batch "
+            f"({', '.join(f'{v} {C.FOLDER_LABEL[c]}' for c, v in sp['reference_samples'].items())} samples) is kept as that "
+            "supplier's reference and never screened; every measurement is compared with it. PASS licence, blind-spot map and "
+            "review lane below use this mode. Stress ladder, Replicate Radar and Controls do not change.\n\n"
+            "**Limits.** The screened pure samples come from the same batch as the reference, so pure-cinnamon results are "
+            "optimistic. **New supplier test** (the model never saw that supplier's samples, and is given only its reference): "
+            f"{pct(ns['blends_flagged'], 0)} of blends flagged, {pct(ns['pure_recognised'], 0)} of pure samples recognised. "
+            "By supplier, blends flagged: " + ", ".join(f"{C.FOLDER_LABEL[c]} {pct(v['blends_flagged'], 0)}"
+                                                       for c, v in ns["by_supplier"].items()) + ".")
     tabs = st.tabs(["Replicate Radar", "Stress ladder", "PASS licence", "Blind-spot map", "Review lane vs forced calls", "Controls"])
     for tab, fn in zip(tabs, (tab_radar, tab_ladder, tab_licence, tab_blind_spot, tab_review, tab_controls)):
         with tab:
             fn()
+
+
+# ---------------------------------------------------------------- Compare
+def filler_short(cur, pool, row) -> str:
+    if TYPES is None:
+        return "not available"
+    if row.candidate == "PASS":
+        return "none suspected"
+    t3, tl = TYPES[SENSORS]
+    p = (tl if pool == "locked" else t3)[cur]
+    top = int(np.argmax(p))
+    if p[top] < FILLER_SURE:
+        return "cannot tell which"
+    return f"{C.FOLDER_LABEL[list(C.FOLDERS)[top]]} (model {pct(p[top], 0)})" + (", if there is any" if row.in_zero else "")
+
+
+def reference_name(smp) -> str:
+    if REF == "supplier":
+        return f"the {C.FOLDER_LABEL[smp.code]} supplier's reference sample"
+    return "pure cinnamon in general"
+
+
+def reference_delta(cur, pool) -> float:
+    """Colour distance to the 0% reference the model may see for this sample."""
+    smp, dev = S.iloc[cur], D.dev
+    if REF == "supplier":
+        ref = S[IS_REF & (S.code == smp.code).to_numpy()][["L", "a", "b"]].mean().to_numpy()
+        return float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - ref))
+    train = dev[S.cell.to_numpy()[dev] != smp.cell] if pool == "dev" else dev
+    refs = color.references(S, train)
+    return float(np.linalg.norm(smp[["L", "a", "b"]].to_numpy(float) - refs.get(smp.code, refs[None])))
+
+
+def page_compare():
+    st.title("Compare two samples")
+    st.caption("Pick two samples to see their screening results side by side. Both use the settings on the left. "
+               "Unlike Inspect, this page shows what each sample really is from the start.")
+    pool = "locked" if SCORED else "dev"
+    df = RES.df[RES.df.pool == pool].set_index("row")
+    cells = sorted(df.cell.unique(), key=lambda c: (c[1], int(c[2:])))
+    defaults = {"A": cells[0], "B": cells[len(cells) // 2]}
+    for side in "AB":
+        if st.session_state.get(f"cmp_cell_{side}") not in cells:
+            st.session_state[f"cmp_cell_{side}"] = defaults[side]
+
+    def from_inspect():
+        smp = S.iloc[st.session_state.cur]
+        st.session_state.cmp_cell_A, st.session_state.cmp_rep_A = smp.cell, int(smp.rep)
+
+    if st.session_state.get("cur") in df.index:
+        st.button("Use the sample from Inspect as sample A", on_click=from_inspect)
+
+    picked = {}
+    cols = st.columns(2, gap="large")
+    for side, col in zip("AB", cols):
+        with col:
+            st.subheader(f"Sample {side}")
+            a, b = st.columns([2, 1])
+            cell = a.selectbox("Material", cells, format_func=cell_name, key=f"cmp_cell_{side}")
+            reps = sorted(S.rep.iloc[df.index[df.cell == cell]].astype(int))
+            if st.session_state.get(f"cmp_rep_{side}") not in reps:
+                st.session_state[f"cmp_rep_{side}"] = reps[0]
+            rep_no = b.selectbox("Sample number", reps, key=f"cmp_rep_{side}",
+                                 help="Each material has up to 50 samples. In supplier-reference mode, half of each pure "
+                                      "batch is kept as the reference and is not offered here.")
+            cur = int(np.flatnonzero(((S.cell == cell) & (S.rep == rep_no)).to_numpy())[0])
+            row, smp = df.loc[cur], S.iloc[cur]
+            picked[side] = (cur, row, smp)
+            st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=describe(smp))
+            lane_card(row.lane, decide.reason(row, RES))
+
+    (ca, ra, sa), (cb, rb, sb) = picked["A"], picked["B"]
+    st.divider()
+    if ca == cb:
+        st.info("Both sides show the same sample. Pick a different material or sample number on one side.")
+    elif ra.lane == rb.lane:
+        st.success(f"Both samples get the same recommendation: **{ra.lane}**.")
+    else:
+        st.warning(f"The recommendations differ: sample A gets **{ra.lane}**, sample B gets **{rb.lane}**.")
+
+    def shortlist(row):
+        return ", ".join(BAND_NAME[b] for b in C.BANDS if row[f"in_{b}"]) or "none fit"
+
+    def column(cur, row, smp):
+        return [
+            "pure cinnamon (0%)" if smp.level == 0 else f"{C.FOLDER_LABEL[smp.code]}, {smp.level}%",
+            f"{LANE[row.lane]['icon']} {row.lane}",
+            shortlist(row),
+            "yes" if row.covered else "no",
+            filler_short(cur, pool, row),
+            estimate_text(cur, pool),
+            f"{smp.L:.1f}", f"{smp.a:.1f}", f"{smp.b:.1f}",
+            f"{reference_delta(cur, pool):.1f}",
+        ]
+
+    left, right = st.columns([1.25, 1], gap="large")
+    with left:
+        st.subheader("Side by side")
+        table = pd.DataFrame({"Sample A": column(ca, ra, sa), "Sample B": column(cb, rb, sb)}, index=[
+            "What it really is", "Recommendation", "Filler levels not ruled out", "True level is on that shortlist",
+            "Likely filler", "Estimated filler amount", "L* (lightness)", "a* (green to red)", "b* (blue to yellow)", "ΔE to its reference"])
+        st.dataframe(table, width="stretch")
+        gap = float(np.linalg.norm(sa[["L", "a", "b"]].to_numpy(float) - sb[["L", "a", "b"]].to_numpy(float)))
+        st.metric("Colour difference between A and B (ΔE)", f"{gap:.1f}",
+                  help="Distance between the two colorimeter readings. Under about 2 is hard to see by eye.")
+    with right:
+        fig = go.Figure()
+        for name, row, colr in (("Sample A", ra, "#2a78d6"), ("Sample B", rb, "#eb6834")):
+            fig.add_trace(go.Bar(y=[BAND_NAME[b] for b in C.BANDS], x=[row[f"p_{b}"] for b in C.BANDS], orientation="h",
+                                 name=name, marker_color=colr, text=[pct(row[f"p_{b}"], 0) for b in C.BANDS],
+                                 textposition="outside", cliponaxis=False,
+                                 hovertemplate="%{y}: %{x:.1%}<extra>" + name + "</extra>"))
+        chart(fig, 360, title="How likely each filler level is, according to the model", barmode="group", bargap=0.3,
+              xaxis=dict(range=[0, 1.12], tickformat=".0%", showgrid=False), yaxis=dict(autorange="reversed"),
+              legend=dict(orientation="h", y=-0.15, traceorder="normal"))
+    st.caption("The model is often very sure and still wrong on materials it has not seen, which is why the shortlist "
+               "can be longer than the bars suggest.")
+
+
+# ---------------------------------------------------------------- Scoreboard
+def _fmt(key, v):
+    if v != v:  # NaN
+        return "–"
+    return f"{v:.1f}" if key == "amount_error" else (f"{v:,}" if key in ("n", "materials") else pct(v))
+
+
+def mode_numbers(ref, pool="dev"):
+    """Headline, baseline and model numbers for one reference mode, current settings."""
+    res = evaluate(STAMP, ref, MODE, ALPHA, MUST, BAR, SENSORS)
+    df = res.df[res.df.pool == pool]
+    _, types, levels, _ = ART[ref]
+    rows = df.row.to_numpy()
+    lv, codes = S.level.to_numpy(), S.code.map(list(C.FOLDERS).index).to_numpy()
+    est = (levels[SENSORS][1 if pool == "locked" else 0]) if levels else None
+    typ = (types[SENSORS][1 if pool == "locked" else 0]) if types else None
+    out = scoreboard.from_lanes(df)
+    out["amount_error"] = scoreboard.amount_error(est, rows, lv) if est is not None else float("nan")
+    out["filler_right"] = scoreboard.filler_right(typ, rows, lv, codes) if typ is not None else float("nan")
+    return out, scoreboard.forced(df)
+
+
+def page_scoreboard():
+    st.title("Scoreboard")
+    st.caption(f"How well the screen does on materials it has never seen. Settings from the sidebar: compared with "
+               f"{REF_LABEL[REF].lower()} · {MODE_LABEL[MODE].lower()} · {SET_LABEL[SENSORS]} · must catch {MUST}% or "
+               f"more · {CONF}% sure.")
+    st.info("**In plain words:** each sample here was judged by a model that had never seen that material. "
+            "These are the fair numbers. Scores on samples the model has seen near-copies of are much higher and are "
+            "shown in section 3 only for contrast.")
+
+    cur, _ = mode_numbers(REF)
+    st.subheader("1 · At a glance")
+    cards = [
+        ("wrong_pass", "Released without a lab check although adulterated. The most serious error.", cur["wrong_pass"] == 0, "target 0%"),
+        ("pure_held", "Pure cinnamon held back: a delay and a lab fee for nothing.", cur["pure_held"] <= 0.05, "target ≤ 5%"),
+        ("decided", "Samples the screen settled itself. The rest go to the lab, so higher means more lab work saved.", None, "higher is better"),
+        ("decided_right", "Of the PASS and HOLD calls it made, how many were correct.", cur["decided_right"] >= 0.95, "target ≥ 95%"),
+        ("range_has_truth", f"How often the true amount falls in the screen's range. You asked for {CONF}%.",
+         cur["range_has_truth"] >= CONF / 100, f"target ≥ {CONF}%"),
+    ]
+    cols = st.columns(len(cards))
+    for col, (key, text, ok, target) in zip(cols, cards):
+        mark = "" if ok is None else ("✓ " if ok else "✗ ")
+        short = {"wrong_pass": "Adulterated passed", "pure_held": "Pure held", "decided": "Decided",
+                 "decided_right": "Right decisions", "range_has_truth": "Range has truth"}[key]
+        col.metric(short, _fmt(key, cur[key]), help=scoreboard.LABEL[key])
+        col.caption(f"{mark}{target}. {text}")
+    if REF == "supplier":
+        st.caption("⚠️ Supplier reference: the pure samples tested come from the same batch as the reference, so the "
+                   "pure-cinnamon numbers are optimistic.")
+
+    st.subheader("2 · Side by side")
+    gen, base = mode_numbers("general")
+    cols_data = {"General screen": gen}
+    if "supplier" in ART:
+        cols_data["Supplier reference"] = mode_numbers("supplier")[0]
+    cols_data["Forced-answer baseline"] = {**base, "amount_error": gen["amount_error"], "filler_right": gen["filler_right"]}
+    keys = scoreboard.HEADLINE + ["amount_error", "filler_right", "n", "materials"]
+    side = pd.DataFrame({name: [_fmt(k, d[k]) for k in keys] for name, d in cols_data.items()},
+                        index=[scoreboard.LABEL[k] for k in keys])
+    st.dataframe(side, width="stretch")
+    st.caption("The forced-answer baseline is the general screen's model made to answer every sample: PASS if its top "
+               "guess is 0%, HOLD otherwise. It never abstains, so it gives no range. Its amount and filler rows are the "
+               "general model's. “Right” is scored as on Inspect: HOLD on any adulterated sample counts as right.")
+
+    st.subheader("3 · Easy test against fair test")
+    st.caption("Easy: the model has seen near-copies of the test samples (random split). Fair: it has never seen the "
+               "material. The drop shows how much of the easy score came from recognising repeats.")
+    ev = scoreboard.easy_vs_fair(pd.DataFrame(R["rows"]))
+    show = pd.DataFrame({"Instruments": ev.sensor_set.map(SET_LABEL)})
+    for name in ("Pure vs adulterated (balanced accuracy)", "Filler level band (macro-F1)", "Amount error (points)"):
+        e, f = ev[f"{name} · easy"], ev[f"{name} · fair"]
+        digits = 1 if "points" in name else 2
+        show[name] = [f"{a:.{digits}f} → {b:.{digits}f}" for a, b in zip(e, f)]
+    st.dataframe(show, hide_index=True, width="stretch")
+    st.caption("Balanced accuracy: 0.50 is coin-flip. Macro-F1: 0 to 1, each band weighted equally. Amount error: "
+               "average distance from the true filler percentage. These come from the general screen.")
+
+    st.subheader("4 · Final test: the locked materials")
+    if not SCORED:
+        st.warning("🔒 **Not scored yet.** Levels 3%, 10% and 18% of every filler (9 materials, 450 samples) have never been "
+                   "used for training, tuning or any number on this page. They are scored once, at the end. Those are the "
+                   "numbers to quote.")
+        st.code(".venv/bin/python -m earnedpass.run_all --score-locked", language="bash")
+    else:
+        st.success(f"Scored once at {R['meta']['locked_scored_at']}. These are the numbers to quote.")
+        locked = {"General screen": mode_numbers("general", "locked")[0]}
+        if "supplier" in ART:
+            locked["Supplier reference"] = mode_numbers("supplier", "locked")[0]
+        st.dataframe(pd.DataFrame({n: [_fmt(k, d[k]) for k in keys] for n, d in locked.items()},
+                                  index=[scoreboard.LABEL[k] for k in keys]), width="stretch")
+
+    csv = pd.concat([side.rename_axis("metric").reset_index().assign(table="side_by_side"),
+                     show.assign(table="easy_vs_fair")], ignore_index=True)
+    st.download_button("Download these tables (CSV)", csv.to_csv(index=False).encode(), "earned_pass_scoreboard.csv",
+                       "text/csv")
 
 
 # ---------------------------------------------------------------- Log
@@ -549,6 +990,8 @@ def page_log():
 
 st.navigation([
     st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
+    st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
+    st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
     st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
     st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"),
 ]).run()
