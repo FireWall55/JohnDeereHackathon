@@ -11,12 +11,15 @@ it is pure. Reads artifacts written by `python -m earnedpass.run_all`.
 from __future__ import annotations
 
 import datetime as dt
+import html
 import json
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from earnedpass import config as C
 from earnedpass import data as data_mod
@@ -29,21 +32,186 @@ LOG = C.ARTIFACTS / "decision_log.csv"
 LOG_COLUMNS = ["time", "sample_id", "model_version", "sensors", "wood_lab", "wood_reject", "peanut_limit",
                "walnut_limit", "recommended", "labels", "decision", "override", "sent_to_lab", "user"]
 
-# Status colours always travel with an icon and a word, never alone.
+st.set_page_config(page_title="Earned Pass", page_icon=":material/science:", layout="wide")
+
+# The palettes. The page colours are also set in .streamlit/config.toml; keep the two in step.
+# The browser reports which theme is showing; the "Dark mode" toggle switches it.
+DARK = getattr(st.context.theme, "type", None) == "dark"
+LIGHT_PALETTE = dict(INK="#231C17", MUTED="#6F655C", LINE="#E2D9CB", PAPER="#FBF8F3", SURFACE="#FFFFFF", BRAND="#A6451C",
+                     TRACK="#EDE5D8", THEAD="#F5F0E8", FAINT="#B9AFA2", GRID="#ECE4D7", MID="#CFC6B8", LOCKED="#F2ECE3",
+                     SHADOW="rgba(35,28,23,.55)")
+DARK_PALETTE = dict(INK="#EEE7DD", MUTED="#A99E92", LINE="#3B332C", PAPER="#16120F", SURFACE="#211B17", BRAND="#E07A45",
+                    TRACK="#332B25", THEAD="#28211C", FAINT="#5E544B", GRID="#2C2520", MID="#6B6157", LOCKED="#2A231E",
+                    SHADOW="rgba(0,0,0,.7)")
+PAL = DARK_PALETTE if DARK else LIGHT_PALETTE
+INK, MUTED, LINE, PAPER, SURFACE, BRAND = (PAL[k] for k in ("INK", "MUTED", "LINE", "PAPER", "SURFACE", "BRAND"))
+RED, ORANGE, BLUE, AMBER, GREEN, GREY = "#B3261E", "#E0761B", "#1F5FBF", "#EAB308", "#1D7A46", "#8C8378"
+if DARK:  # the same hues, lifted so they read on a dark page
+    BLUE, GREEN, RED = "#3D7BE0", "#2E9E68", "#D2392F"
+
+# Status colours always travel with an icon and a word, never alone. "ink" is the text colour on that fill.
 LANE = {
-    V.REJECT: {"title": "REJECT", "icon": "✕", "colour": "#d03b3b", "text": "wood dust: reject and discard the lot"},
-    V.LAB_WOOD: {"title": "LAB", "icon": "⚠", "colour": "#ec835a", "text": "possible wood dust: confirm at the lab before any use"},
-    V.LABEL: {"title": "LABEL", "icon": "🏷", "colour": "#2a78d6", "text": "nut-shell material found: label the lot"},
-    V.LAB_PURE: {"title": "LAB", "icon": "⧖", "colour": "#fab219", "text": "no filler found: the lab verifies it is pure"},
+    V.REJECT: {"title": "REJECT", "icon": "✕", "colour": RED, "ink": "#FFFFFF", "text": "wood dust: reject and discard the lot"},
+    V.LAB_WOOD: {"title": "LAB", "icon": "▲", "colour": ORANGE, "ink": "#2A1403", "text": "possible wood dust: confirm at the lab before any use"},
+    V.LABEL: {"title": "LABEL", "icon": "◆", "colour": BLUE, "ink": "#FFFFFF", "text": "nut-shell material found: label the lot"},
+    V.LAB_PURE: {"title": "LAB", "icon": "○", "colour": AMBER, "ink": "#2A2003", "text": "no filler found: the lab verifies it is pure"},
 }
-LANE_CHOICE = {V.REJECT: "✕ Reject", V.LAB_WOOD: "⚠ Lab (wood risk)", V.LABEL: "🏷 Label", V.LAB_PURE: "⧖ Lab (verify pure)"}
-FILLER_COLOUR = {"P": "#2a78d6", "W": "#eb6834", "D": "#1baf7a"}
-SEQ = [[0.0, "#cde2fb"], [0.5, "#3987e5"], [1.0, "#0d366b"]]
+LANE_CHOICE = {V.REJECT: "✕ Reject", V.LAB_WOOD: "▲ Lab (wood risk)", V.LABEL: "◆ Label", V.LAB_PURE: "○ Lab (verify pure)"}
+FILLER_COLOUR = {"P": BLUE, "W": "#D9641E", "D": "#1E9E6F"}
+SEQ = [[0.0, "#E6EEFA"], [0.5, "#3C7BD9"], [1.0, "#0E2F66"]]
 SET_LABEL = {"colour": "Colorimeter", "ftir": "FTIR", "image": "Photo", "colour+ftir": "Colorimeter + FTIR",
              "colour+image": "Colorimeter + photo", "ftir+image": "FTIR + photo", "all": "All three"}
 TRUTH = {"P": "Peanut shell", "W": "Walnut shell", "D": "Wood dust"}
 
-st.set_page_config(page_title="Earned Pass", page_icon="🧪", layout="wide")
+SERIF = '"Source Serif","Source Serif 4","Source Serif Pro",Georgia,serif'
+CSS = f"""
+:root {{ --ink:{INK}; --muted:{MUTED}; --line:{LINE}; --paper:{PAPER}; --surface:{SURFACE}; --brand:{BRAND};
+  --track:{PAL['TRACK']}; --thead:{PAL['THEAD']}; --faint:{PAL['FAINT']}; --shadow:{PAL['SHADOW']}; }}
+
+/* The theme switch at the top right of every page. */
+.st-key-theme_bar {{ display:flex; flex-direction:row; justify-content:flex-end; margin:-.5rem 0 -1.2rem; }}
+.st-key-theme_bar > div {{ width:auto; }}
+.st-key-theme_bar label p {{ font-size:.85rem; color:var(--muted); }}
+.st-key-theme_bar + div:has(iframe[height="0"]), div:has(> iframe[height="0"]) {{ display:none; }}
+
+/* Page frame: a readable column with even margins, whatever the window width. */
+[data-testid="stMainBlockContainer"] {{ max-width:1240px; padding:4.6rem 3rem 6rem; }}
+[data-testid="stMainBlockContainer"] h1 {{ font-size:2.6rem; letter-spacing:-.02em; line-height:1.1; padding:0 0 1.1rem; }}
+[data-testid="stMainBlockContainer"] h1::after {{ content:""; display:block; width:48px; height:4px; border-radius:2px;
+  background:var(--brand); margin-top:.8rem; }}
+[data-testid="stMainBlockContainer"] h3 {{ font-size:1.35rem; letter-spacing:-.01em; padding:1.5rem 0 .5rem; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:var(--muted); opacity:1; }}
+[data-testid="stImageCaption"] {{ color:var(--muted); opacity:1; }}
+
+/* Built-in pieces, brought onto the same surface-and-line treatment. */
+[data-testid="stMetric"] {{ background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1rem 1.2rem; }}
+[data-testid="stMetricValue"] {{ font-weight:700; letter-spacing:-.02em; }}
+[data-testid="stImage"] img {{ border-radius:16px; border:1px solid var(--line); box-shadow:0 18px 30px -24px var(--shadow); }}
+[data-testid="stExpander"] details {{ background:var(--surface); border-color:var(--line); }}
+[data-testid="stExpander"] summary {{ font-weight:600; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ background:var(--surface); }}
+.stButton button, .stDownloadButton button {{ font-weight:600; }}
+[data-testid="stSidebarUserContent"] {{ padding-top:.5rem; }}
+[data-testid="stSidebar"] h2 {{ font-size:1.15rem; }}
+[data-testid="stSidebar"] h3 {{ font-size:1rem; padding-top:.6rem; }}
+
+/* Shared small parts. */
+.ep-eyebrow {{ font-size:.72rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }}
+.ep-card {{ background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:1.25rem 1.5rem; }}
+.ep-brand {{ display:flex; gap:.7rem; align-items:center; padding:.2rem 0 1rem; border-bottom:1px solid var(--line); margin-bottom:.6rem; }}
+.ep-brand-mark {{ flex:none; width:2.1rem; height:2.1rem; border-radius:9px; background:var(--brand); color:#fff;
+  display:grid; place-items:center; font-family:{SERIF}; font-weight:700; font-size:1.15rem; }}
+.ep-brand-name {{ font-family:{SERIF}; font-weight:700; font-size:1.25rem; line-height:1.1; letter-spacing:-.01em; }}
+.ep-brand-tag {{ font-size:.78rem; color:var(--muted); }}
+.ep-callout {{ background:var(--surface); border:1px solid var(--line); border-left:4px solid var(--brand); border-radius:10px;
+  padding:.9rem 1.15rem; line-height:1.5; }}
+.ep-callout .ep-eyebrow {{ color:var(--brand); margin-bottom:.25rem; }}
+.ep-step {{ display:flex; gap:.5rem; align-items:baseline; margin:.1rem 0 .9rem; }}
+.ep-step .ep-eyebrow {{ color:var(--brand); white-space:nowrap; }}
+.ep-step span {{ color:var(--muted); font-size:.92rem; }}
+
+/* The verdict and whether it was right. */
+.ep-row {{ display:grid; grid-template-columns:1.65fr 1fr; gap:1rem; align-items:stretch; }}
+.ep-verdict {{ background:var(--c); color:var(--fg); border-radius:16px; padding:1.25rem 1.5rem 1.4rem;
+  box-shadow:0 16px 28px -20px var(--c); }}
+.ep-verdict .ep-eyebrow {{ opacity:.82; }}
+.ep-verdict-title {{ display:flex; align-items:center; gap:.75rem; font-size:2.7rem; font-weight:800; line-height:1.05;
+  letter-spacing:.01em; margin:.45rem 0 .5rem; }}
+.ep-glyph {{ flex:none; display:grid; place-items:center; width:2.7rem; height:2.7rem; border-radius:11px;
+  background:rgba(255,255,255,.22); font-size:1.35rem; font-weight:700; }}
+.ep-verdict-text {{ font-size:1.15rem; font-weight:600; }}
+.ep-verdict.small {{ padding:.9rem 1.1rem 1rem; border-radius:14px; }}
+.ep-verdict.small .ep-verdict-title {{ font-size:1.7rem; gap:.55rem; margin:.1rem 0 .3rem; }}
+.ep-verdict.small .ep-glyph {{ width:2rem; height:2rem; border-radius:8px; font-size:1rem; }}
+.ep-verdict.small .ep-verdict-text {{ font-size:.98rem; }}
+.ep-truth {{ border-top:5px solid var(--c); }}
+.ep-truth .ep-eyebrow {{ color:var(--muted); }}
+.ep-truth-title {{ font-size:2rem; font-weight:800; line-height:1.1; color:var(--c); margin:.5rem 0 .4rem; }}
+.ep-truth-text {{ color:var(--ink); line-height:1.4; }}
+
+/* One meter per filler, with its limits as ticks. */
+.ep-meter {{ margin-bottom:1.05rem; }}
+.ep-meter-head {{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:.4rem; }}
+.ep-meter-name {{ font-weight:600; }}
+.ep-meter-val {{ font-weight:800; font-variant-numeric:tabular-nums; color:var(--c); }}
+.ep-meter-val small {{ font-weight:600; font-size:.82rem; margin-left:.45rem; }}
+.ep-track {{ position:relative; height:14px; border-radius:7px; background:var(--track); }}
+.ep-fill {{ height:100%; border-radius:7px; background:var(--c); }}
+.ep-tick {{ position:absolute; top:-4px; bottom:-4px; width:2px; margin-left:-1px; border-radius:1px; background:var(--ink); }}
+.ep-meter-foot {{ font-size:.78rem; color:var(--muted); margin-top:.35rem; }}
+
+/* The sample table, with tinted cells. */
+.ep-table {{ width:100%; border-collapse:separate; border-spacing:0; background:var(--surface); border:1px solid var(--line);
+  border-radius:12px; overflow:hidden; font-size:.93rem; }}
+.ep-table th, .ep-table td {{ padding:.55rem .9rem; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; }}
+.ep-table tr:last-child td {{ border-bottom:0; }}
+.ep-table thead th {{ background:var(--thead); color:var(--muted); font-size:.72rem; letter-spacing:.1em; text-transform:uppercase; }}
+.ep-table td.k {{ color:var(--muted); white-space:nowrap; width:1%; }}
+.ep-table td.v {{ font-variant-numeric:tabular-nums; }}
+.ep-table.counts th, .ep-table.counts td {{ text-align:right; }}
+.ep-table.counts th:first-child, .ep-table.counts td.k {{ text-align:left; white-space:nowrap; width:1%; }}
+.ep-table.counts thead th {{ letter-spacing:0; text-transform:none; font-size:.82rem; font-weight:600; vertical-align:bottom;
+  line-height:1.3; }}
+.ep-table.counts td.zero {{ color:var(--faint); }}
+.ep-table.counts td.some {{ font-weight:700; }}
+.ep-table td.tint {{ background:color-mix(in srgb, var(--c) 14%, var(--surface)); font-weight:600; }}
+.ep-dot {{ display:inline-block; width:.55rem; height:.55rem; border-radius:50%; background:var(--c); margin-right:.5rem; }}
+.ep-legend {{ display:flex; flex-wrap:wrap; gap:.3rem 1.1rem; font-size:.8rem; color:var(--muted); margin-top:.55rem; }}
+
+/* Scoreboard. */
+.ep-hero {{ display:flex; gap:1rem; align-items:center; }}
+.ep-hero-mark {{ flex:none; width:2.6rem; height:2.6rem; border-radius:50%; display:grid; place-items:center; background:var(--c);
+  color:#fff; font-weight:800; font-size:1.25rem; }}
+.ep-hero-text {{ font-family:{SERIF}; font-size:1.5rem; font-weight:600; line-height:1.3; letter-spacing:-.01em; }}
+.ep-kpis {{ display:grid; grid-template-columns:repeat(6,1fr); gap:.8rem; }}
+.ep-kpi {{ background:var(--surface); border:1px solid var(--line); border-top:4px solid var(--c); border-radius:14px;
+  padding:.95rem 1rem 1.05rem; }}
+.ep-kpi-name {{ font-size:.82rem; font-weight:600; color:var(--muted); }}
+.ep-kpi-val {{ font-size:2rem; font-weight:800; letter-spacing:-.02em; line-height:1.1; font-variant-numeric:tabular-nums;
+  margin:.25rem 0 .5rem; }}
+.ep-chip {{ display:inline-block; font-size:.72rem; font-weight:700; padding:.14rem .55rem; border-radius:999px; color:var(--c);
+  background:color-mix(in srgb, var(--c) 16%, var(--surface)); }}
+.ep-kpi-text {{ font-size:.8rem; color:var(--muted); line-height:1.4; margin-top:.55rem; }}
+
+/* Details: decision path and colour swatches. */
+.ep-path {{ display:flex; flex-wrap:wrap; gap:.4rem; align-items:stretch; font-size:.86rem; }}
+.ep-path-step {{ padding:.45rem .75rem; border-radius:10px; border:1px solid var(--line); background:var(--paper); line-height:1.35; }}
+.ep-path-step small {{ display:block; color:var(--muted); }}
+.ep-path-step.fired {{ border:2px solid var(--c); background:color-mix(in srgb, var(--c) 12%, var(--surface)); font-weight:600; }}
+.ep-path-step.fired small {{ color:var(--ink); }}
+.ep-path-step.skipped {{ opacity:.45; }}
+.ep-path-arrow {{ align-self:center; color:var(--muted); }}
+.ep-swatches {{ display:flex; align-items:center; gap:1rem; flex-wrap:wrap; }}
+.ep-swatch {{ text-align:center; font-size:.8rem; color:var(--muted); }}
+.ep-swatch i {{ display:block; width:84px; height:52px; border-radius:10px; border:1px solid var(--line); margin-bottom:.3rem; }}
+.ep-swatch-gap {{ text-align:center; font-size:.9rem; }}
+.ep-swatch-gap small {{ display:block; color:var(--muted); }}
+
+@media (max-width: 1000px) {{
+  [data-testid="stMainBlockContainer"] {{ padding-left:1.25rem; padding-right:1.25rem; }}
+  .ep-row {{ grid-template-columns:1fr; }}
+  .ep-kpis {{ grid-template-columns:repeat(2,1fr); }}
+}}
+"""
+st.html(f"<style>{CSS}</style>")
+
+
+def esc(x) -> str:
+    return html.escape(str(x))
+
+
+def rich(text: str) -> str:
+    """Escaped text, with **bold** kept."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(text))
+
+
+def plain(text: str, label="In plain words"):
+    """The one-paragraph summary at the top of a page or tab."""
+    st.html(f'<div class="ep-callout"><div class="ep-eyebrow">{esc(label)}</div>{rich(text)}</div>')
+
+
+def step(label: str, text: str = ""):
+    st.html(f'<div class="ep-step"><div class="ep-eyebrow">{esc(label)}</div><span>{rich(text)}</span></div>')
 
 
 # ---------------------------------------------------------------- loading
@@ -84,6 +252,8 @@ SCORED = bool(R["meta"]["locked_scored_at"])
 POOL = "locked" if SCORED else "dev"
 
 with st.sidebar:
+    st.html('<div class="ep-brand"><div class="ep-brand-mark">E</div><div><div class="ep-brand-name">Earned Pass</div>'
+            '<div class="ep-brand-tag">Receiving screen for ground cinnamon</div></div></div>')
     st.header("Screen settings")
     st.caption("A QC manager sets these once, before the screen is used. The starting values are the team's defaults.")
     EXPLAIN = st.toggle("Explain each setting", True)
@@ -92,8 +262,8 @@ with st.sidebar:
         if EXPLAIN:
             st.caption(text)
 
-    st.caption("**Compared with:** each supplier's own reference sample. ⚠️ The pure samples tested come from the "
-               "same batch as the reference, so results on pure cinnamon are optimistic.")
+    st.caption("**Compared with:** each supplier's own reference sample. Note that the pure samples tested come from "
+               "the same batch as the reference, so results on pure cinnamon are optimistic.")
     SENSORS = st.selectbox("Instruments used for screening", list(C.SENSOR_SETS), index=list(C.SENSOR_SETS).index(C.SCREEN_SET),
                            format_func=SET_LABEL.get)
     note("A colorimeter and a camera are what an inspector has at the receiving dock. FTIR is a lab instrument.")
@@ -127,7 +297,14 @@ def pct(x, digits=1):
 
 
 def chart(fig, height=320, **kw):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=10), **kw)
+    """Every chart gets the same frame: left-aligned title, quiet grid, the page's ink for text."""
+    if isinstance(kw.get("title"), str):
+        kw["title"] = dict(text=kw["title"], x=0, xanchor="left", font=dict(size=15, color=INK))
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=48 if kw.get("title") else 14, b=10),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=INK),
+                      hoverlabel=dict(bgcolor=SURFACE, bordercolor=LINE, font=dict(color=INK)), **kw)
+    fig.update_xaxes(gridcolor=PAL["GRID"], linecolor=LINE, zerolinecolor=LINE)
+    fig.update_yaxes(gridcolor=PAL["GRID"], linecolor=LINE, zerolinecolor=LINE)
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
@@ -144,7 +321,7 @@ def describe(sample) -> str:
 
 
 def tab_radar():
-    st.info('**In plain words:** the dataset looks like 1,950 separate samples, but many are the same powder measured again and again. This tab shows the proof. It matters because a model tested on near-copies of what it trained on will look far better than it is.')
+    plain("The dataset looks like 1,950 separate samples, but many are the same powder measured again and again. This tab shows the proof. It matters because a model tested on near-copies of what it trained on will look far better than it is.")
     rd = R["radar"]
     st.markdown("Each adulterant-and-level **cell** holds 50 sample IDs. They are repeat measurements of one prepared "
                 "material, so treating them as 50 independent samples is what field statistics calls *pseudoreplication* "
@@ -180,7 +357,7 @@ def tab_radar():
     gap = np.full((len(rows), 1), np.nan)  # one trace, with a break between spectra
     fig = go.Figure(go.Scatter(x=np.hstack([np.tile(D.wavenumbers, (len(rows), 1)), gap]).ravel(),
                                y=np.hstack([SPECTRA.raw[rows], gap]).ravel(), mode="lines",
-                               line=dict(color="#2a78d6", width=1), opacity=0.3, hoverinfo="skip"))
+                               line=dict(color=BLUE, width=1), opacity=0.3, hoverinfo="skip"))
     chart(fig, 300, title=f"{name}: absorbance of all 50 stored spectra, overlaid",
           xaxis=dict(title="Wavenumber (cm⁻¹)", autorange="reversed"), yaxis=dict(title="Absorbance"))
     groups = "; ".join(f"{C.FOLDER_LABEL[k]}: " + ", ".join("–".join(map(str, (g[0], g[-1]))) + "%" if len(g) > 1 else f"{g[0]}%"
@@ -199,7 +376,7 @@ def tab_radar():
     n = t.value_counts().sort_index()
     fig = go.Figure(go.Scatter(x=n.index, y=[0] * len(n), mode="markers+text", text=[f"{k} IDs" for k in n],
                                textposition="top center", cliponaxis=False,
-                               marker=dict(size=8 + 3 * np.sqrt(n.to_numpy()), color="#2a78d6"),
+                               marker=dict(size=8 + 3 * np.sqrt(n.to_numpy()), color=BLUE),
                                hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{text}<extra></extra>"))
     chart(fig, 170, title=f"{name}: {len(n)} distinct photo timestamps for 50 sample IDs, " +
           (f"{span:.0f} seconds apart at most" if span < 3600 else "spread over more than one sitting"),
@@ -209,7 +386,7 @@ def tab_radar():
 
 
 def tab_ladder():
-    st.info('**In plain words:** the same model sits four exams, from easy to fair. In exams 1 and 2 it has already seen near-copies of the test samples. In exam 3 the test material is new, and in exam 4 the whole filler folder is new. Each square is a score (darker is higher). Watch the scores drop from left to right. The bottom-left chart shows error, so there darker is worse.')
+    plain("The same model sits four exams, from easy to fair. In exams 1 and 2 it has already seen near-copies of the test samples. In exam 3 the test material is new, and in exam 4 the whole filler folder is new. Each square is a score (darker is higher). Watch the scores drop from left to right. The bottom-left chart shows error, so there darker is worse.")
     fl = R["floor"]
     st.markdown("One fixed model per sensor set, scored on four splits of rising strictness. Only the split changes.")
     st.caption(f"Floor: always answering “adulterated” scores {pct(fl['always_adulterated_plain_accuracy_all_39_cells'])} plain "
@@ -234,7 +411,7 @@ def tab_ladder():
 
 
 def tab_controls():
-    st.info('**In plain words:** four sanity checks on whether the models learned about the powder itself, or about accidents of how the dataset was made (which day a photo was taken, which folder a file sits in).')
+    plain("Four sanity checks on whether the models learned about the powder itself, or about accidents of how the dataset was made (which day a photo was taken, which folder a file sits in).")
     c = R["controls"]
     st.subheader("Session probe")
     sp = c["session_probe"]
@@ -277,17 +454,17 @@ def tab_controls():
 
 
 
-def lane_card(row):
+def verdict_html(row, small=False, eyebrow="") -> str:
+    """The verdict as a solid block of its status colour: icon, word, one instruction."""
     m = LANE[row.lane]
-    labels = label_text(row)
-    extra = f"<div style='margin-top:.3rem'><b>Label:</b> {labels}</div>" if labels else ""
-    st.markdown(
-        f"""<div style="border-left:6px solid {m['colour']};padding:.6rem 1rem;border-radius:6px;
-        background:color-mix(in srgb,{m['colour']} 9%,transparent)">
-        <div style="font-size:1.9rem;font-weight:700;line-height:1.2">{m['icon']} {m['title']}</div>
-        <div style="opacity:.8">{m['text']}</div>{extra}</div>""",
-        unsafe_allow_html=True,
-    )
+    head = f'<div class="ep-eyebrow">{esc(eyebrow)}</div>' if eyebrow else ""
+    return (f'<div class="ep-verdict{" small" if small else ""}" style="--c:{m["colour"]};--fg:{m["ink"]}">{head}'
+            f'<div class="ep-verdict-title"><span class="ep-glyph">{m["icon"]}</span>{m["title"]}</div>'
+            f'<div class="ep-verdict-text">{esc(instruction(row))}</div></div>')
+
+
+def lane_card(row):
+    st.html(verdict_html(row, small=True))
 
 
 def label_text(row) -> str:
@@ -320,7 +497,7 @@ def chance_rows(row) -> dict:
     if row.p_wood > WOOD_REJECT / 100:
         wood = f"{pct(row.p_wood, 0)} · ✕ above the {WOOD_REJECT}% reject limit"
     elif row.p_wood > WOOD_LAB / 100:
-        wood = f"{pct(row.p_wood, 0)} · ⚠ above the {WOOD_LAB}% lab limit"
+        wood = f"{pct(row.p_wood, 0)} · ▲ above the {WOOD_LAB}% lab limit"
     else:
         wood = f"{pct(row.p_wood, 0)} · below the {WOOD_LAB}% lab limit"
     return {"Chance of peanut shell": mark(row.p_peanut, PEANUT), "Chance of walnut shell": mark(row.p_walnut, WALNUT),
@@ -365,8 +542,7 @@ def verdict_check(row, smp) -> str:
             "wrong": "✗ wrong: wrong nut labelled"}[row.result]
 
 
-TINT = {"green": "rgba(12,163,12,.22)", "red": "rgba(208,59,59,.28)", "orange": "rgba(236,131,90,.30)",
-        "blue": "rgba(42,120,214,.26)", "yellow": "rgba(250,178,25,.28)"}
+TINT = {"green": GREEN, "red": RED, "orange": ORANGE, "blue": BLUE, "yellow": AMBER}
 
 
 def chance_colour(p, limits):
@@ -407,19 +583,23 @@ def sample_rows(row, smp, cur, show_truth, extras=False):
     return rows, colours
 
 
-def styled(columns: dict):
-    """columns: {name: (rows, colours)} -> a colour-coded table."""
-    df = pd.DataFrame({name: rc[0] for name, rc in columns.items()})
-
-    def paint(col):
-        colours = columns[col.name][1]
-        return [f"background-color: {TINT[colours[k]]}" if k in colours else "" for k in col.index]
-
-    return df.style.apply(paint, axis=0)
-
-
-BANNER = {V.REJECT: ("#d03b3b", "#ffffff"), V.LAB_WOOD: ("#ec835a", "#2c1206"), V.LABEL: ("#2a78d6", "#ffffff"),
-          V.LAB_PURE: ("#fab219", "#2c2006")}
+def sample_table(columns: dict):
+    """columns: {name: (rows, colours)} -> a colour-coded table, one column per sample."""
+    keys = list(dict.fromkeys(k for rows, _ in columns.values() for k in rows))
+    body = []
+    for k in keys:
+        cells = []
+        for rows, colours in columns.values():
+            if k in colours:
+                cells.append(f'<td class="v tint" style="--c:{TINT[colours[k]]}"><span class="ep-dot"></span>{esc(rows.get(k, ""))}</td>')
+            else:
+                cells.append(f'<td class="v">{esc(rows.get(k, ""))}</td>')
+        body.append(f'<tr><td class="k">{esc(k)}</td>{"".join(cells)}</tr>')
+    head = "".join(f"<th>{esc(name)}</th>" for name in columns)
+    legend = "".join(f'<span><span class="ep-dot" style="--c:{c}"></span>{t}</span>' for c, t in (
+        (GREEN, "below its limit, or right"), (BLUE, "label"), (ORANGE, "wood risk"), (RED, "reject, or wrong")))
+    st.html(f'<table class="ep-table"><thead><tr><th></th>{head}</tr></thead><tbody>{"".join(body)}</tbody></table>'
+            f'<div class="ep-legend">{legend}</div>')
 
 
 def instruction(row) -> str:
@@ -432,32 +612,21 @@ def instruction(row) -> str:
     return "Send to the lab to confirm it is pure."
 
 
-def verdict_banner(row):
-    bg, fg = BANNER[row.lane]
-    m = LANE[row.lane]
-    st.markdown(
-        f"""<div style="background:{bg};color:{fg};padding:.9rem 1.2rem;border-radius:10px">
-        <div style="font-size:.85rem;font-weight:600;opacity:.85">① THE VERDICT</div>
-        <div style="font-size:2.1rem;font-weight:800;line-height:1.15">{m['icon']} {m['title']}</div>
-        <div style="font-size:1.15rem;font-weight:600">{instruction(row)}</div></div>""",
-        unsafe_allow_html=True)
-
-
-def truth_badge(row, smp, show):
+def truth_html(row, smp, show) -> str:
+    """Whether the verdict matched the ground truth. A quiet card, so the verdict stays the loudest thing."""
     if not show:
-        bg, fg, head, body = "#888780", "#ffffff", "? HIDDEN", "Ground truth appears after you record a decision."
+        colour, head, body = GREY, "? HIDDEN", "Ground truth appears after you record a decision."
     else:
         check = verdict_check(row, smp)
-        kind = check_colour(check)
-        bg, fg, head = {"green": ("#0ca30c", "#ffffff", "✓ RIGHT"), "red": ("#d03b3b", "#ffffff", "✗ WRONG"),
-                        "yellow": ("#fab219", "#2c2006", "◐ PARTLY")}[kind]
+        colour, head = {"green": (GREEN, "✓ RIGHT"), "red": (RED, "✗ WRONG"), "yellow": ("#E0A800" if DARK else "#A97A00", "◐ PARTLY")}[check_colour(check)]
         body = f"It is {truth_name(smp)}." + (f" {check.split(': ', 1)[1].capitalize()}." if ": " in check else "")
-    st.markdown(
-        f"""<div style="background:{bg};color:{fg};padding:.9rem 1.2rem;border-radius:10px;height:100%">
-        <div style="font-size:.85rem;font-weight:600;opacity:.85">WAS THE SCREEN RIGHT?</div>
-        <div style="font-size:2.1rem;font-weight:800;line-height:1.15">{head}</div>
-        <div style="font-size:1rem">{body}</div></div>""",
-        unsafe_allow_html=True)
+    return (f'<div class="ep-card ep-truth" style="--c:{colour}"><div class="ep-eyebrow">Was the screen right?</div>'
+            f'<div class="ep-truth-title">{head}</div><div class="ep-truth-text">{esc(body)}</div></div>')
+
+
+def verdict_row(row, smp, show_truth):
+    """Verdict and truth side by side, in one block so the two cards share a height."""
+    st.html(f'<div class="ep-row">{verdict_html(row, eyebrow="1 · The verdict")}{truth_html(row, smp, show_truth)}</div>')
 
 
 def append_log(row: dict):
@@ -466,34 +635,30 @@ def append_log(row: dict):
     pd.DataFrame([row], columns=LOG_COLUMNS).to_csv(LOG, mode="a", header=not LOG.exists(), index=False)
 
 
-ZONE_COLOUR = {"below": "#9c9a92", "label": "#2a78d6", "lab": "#ec835a", "reject": "#d03b3b"}
+ZONE_COLOUR = {"below": GREY, "label": BLUE, "lab": "#C25E0C", "reject": RED}
+ZONE_WORD = {"below": "below its limit", "label": "label it", "lab": "send to lab", "reject": "reject"}
 
 
 def filler_meters(row):
-    """Three bars, one per filler, each with its limit(s) drawn as lines."""
+    """Three meters, one per filler, each with its limit(s) drawn as ticks on the track."""
     items = [("Peanut shell", row.p_peanut, [(PEANUT, "label")]),
              ("Walnut shell", row.p_walnut, [(WALNUT, "label")]),
              ("Wood dust", row.p_wood, [(WOOD_LAB, "lab"), (WOOD_REJECT, "reject")])]
-    names, vals, colours, words = [], [], [], []
+    out = []
     for name, v, limits in items:
-        zone, word = "below", "below its limit"
+        zone = "below"
         for lim, z in limits:
             if v > lim / 100:
                 zone = z
-                word = {"label": "label it", "lab": "send to lab", "reject": "reject"}[z]
-        names.append(name)
-        vals.append(v)
-        colours.append(ZONE_COLOUR[zone])
-        words.append(f"{pct(v, 0)} · {word}")
-    fig = go.Figure(go.Bar(y=names, x=vals, orientation="h", marker_color=colours, width=0.55, text=words,
-                           textposition="outside", cliponaxis=False, hovertemplate="%{y}: %{x:.1%}<extra></extra>"))
-    for i, (_, _, limits) in enumerate(items):
-        for lim, z in limits:
-            fig.add_shape(type="line", x0=lim / 100, x1=lim / 100, y0=i - 0.42, y1=i + 0.42,
-                          line=dict(color=ZONE_COLOUR[z], width=2, dash="dot"))
-    chart(fig, 190, title="Chance each filler is present (dotted lines are the limits)",
-          xaxis=dict(range=[0, 1.35], tickformat=".0%", showgrid=False, tickvals=[0, 0.25, 0.5, 0.75, 1]),
-          yaxis=dict(autorange="reversed"), showlegend=False)
+        ticks = "".join(f'<div class="ep-tick" style="left:{lim}%" title="{z} limit {lim}%"></div>' for lim, z in limits)
+        foot = ("Limit: " if len(limits) == 1 else "Limits: ") + ", ".join(f"{z} above {lim}%" for lim, z in limits)
+        out.append(
+            f'<div class="ep-meter" style="--c:{ZONE_COLOUR[zone]}"><div class="ep-meter-head">'
+            f'<span class="ep-meter-name">{name}</span>'
+            f'<span class="ep-meter-val">{pct(v, 0)}<small>{ZONE_WORD[zone]}</small></span></div>'
+            f'<div class="ep-track"><div class="ep-fill" style="width:{max(0.0, min(1.0, float(v))):.1%}"></div>{ticks}</div>'
+            f'<div class="ep-meter-foot">{foot}</div></div>')
+    st.html("".join(out))
 
 
 def lab_to_hex(L, a, b) -> str:
@@ -518,18 +683,12 @@ def reference_lab(code):
 
 def swatches(smp, cur):
     ref = reference_lab(smp.code)
-    box = ("display:inline-block;width:64px;height:40px;border-radius:6px;border:1px solid rgba(128,128,128,.4);"
-           "vertical-align:middle")
     d = reference_delta(cur)
     look = "hard to see by eye" if d < 2 else ("visible side by side" if d < 5 else "clearly different")
-    st.markdown(
-        f"""<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-        <div style="text-align:center"><span style="{box};background:{lab_to_hex(*ref)}"></span>
-        <div style="font-size:.8rem;opacity:.75">Supplier's reference</div></div>
-        <div style="text-align:center;font-size:.9rem">ΔE {d:.1f}<br><span style="opacity:.75">{look}</span></div>
-        <div style="text-align:center"><span style="{box};background:{lab_to_hex(smp.L, smp.a, smp.b)}"></span>
-        <div style="font-size:.8rem;opacity:.75">This sample</div></div></div>""",
-        unsafe_allow_html=True)
+    st.html(
+        f'<div class="ep-swatches"><div class="ep-swatch"><i style="background:{lab_to_hex(*ref)}"></i>Supplier\'s reference</div>'
+        f'<div class="ep-swatch-gap"><b>ΔE {d:.1f}</b><small>{look}</small></div>'
+        f'<div class="ep-swatch"><i style="background:{lab_to_hex(smp.L, smp.a, smp.b)}"></i>This sample</div></div>')
     st.caption("Colours as measured by the colorimeter. A screen shows them only approximately.")
 
 
@@ -542,16 +701,9 @@ def decision_path(row):
     fired = [i for i, (_, on) in enumerate(steps) if on][0]
     pills = []
     for i, (text, on) in enumerate(steps):
-        if i < fired:
-            style, mark = "opacity:.55", "no"
-        elif i == fired:
-            style, mark = f"border:2px solid {LANE[row.lane]['colour']};font-weight:600", LANE_CHOICE[row.lane]
-        else:
-            style, mark = "opacity:.3", "not checked"
-        pills.append(f'<div style="padding:.35rem .6rem;border-radius:8px;border:1px solid rgba(128,128,128,.4);{style}">'
-                     f'{text}<br><span style="font-size:.8rem">{mark}</span></div>')
-    st.markdown('<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:stretch;font-size:.85rem">'
-                + '<div style="align-self:center">→</div>'.join(pills) + "</div>", unsafe_allow_html=True)
+        cls, mark = ("", "no") if i < fired else (("fired", LANE_CHOICE[row.lane]) if i == fired else ("skipped", "not checked"))
+        pills.append(f'<div class="ep-path-step {cls}" style="--c:{LANE[row.lane]["colour"]}">{text}<small>{mark}</small></div>')
+    st.html('<div class="ep-path">' + '<div class="ep-path-arrow">→</div>'.join(pills) + "</div>")
 
 
 def how_far_to_trust():
@@ -600,49 +752,44 @@ def page_inspect():
     row, smp = df.loc[cur], S.iloc[cur]
     revealed = cur in ss.recorded
 
-    a, b, c, d = st.columns([0.8, 0.8, 1.2, 2.2], vertical_alignment="center")
-    a.button("◀ Previous", on_click=go_prev, disabled=ss.pos == 0, width="stretch")
-    b.button("Next ▶", on_click=go_next, type="primary", width="stretch")
+    a, b, c, d = st.columns([0.8, 0.8, 1.6, 1.4], vertical_alignment="center")
+    a.button("Previous", icon=":material/arrow_back:", on_click=go_prev, disabled=ss.pos == 0, width="stretch")
+    b.button("Next", icon=":material/arrow_forward:", on_click=go_next, type="primary", width="stretch")
     c.markdown(f"Sample **{ss.pos + 1}** of **{len(ss.hist)}** viewed")
     show_truth = d.toggle("Show ground truth", True, help="What the dataset says the sample really is, and whether the "
                           "verdict was right. Turn off to screen blind; it then appears after you record a decision.")
     truth_visible = show_truth or revealed
 
-    a, b = st.columns([1.6, 1], gap="medium")
-    with a:
-        verdict_banner(row)
-    with b:
-        truth_badge(row, smp, truth_visible)
+    verdict_row(row, smp, truth_visible)
 
     left, right = st.columns([1, 1.5], gap="large")
     with left:
         st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d}")
     with right:
-        st.markdown("**② Why:** the chance of each filler, against the limits in the sidebar")
+        step("2 · Why", "The chance of each filler, against the limits in the sidebar")
         filler_meters(row)
-        st.dataframe(styled({"This sample": sample_rows(row, smp, cur, truth_visible)}), width="stretch")
-        st.caption("Green: below its limit, or right. Blue: label. Orange: wood risk. Red: reject, or wrong.")
+        sample_table({"This sample": sample_rows(row, smp, cur, truth_visible)})
 
-    a, b = st.columns([1.3, 1], gap="large", vertical_alignment="bottom")
-    decision = a.radio("Your decision", V.LANES, index=V.LANES.index(ss.recorded.get(cur, row.lane)), horizontal=True,
-                       key=f"decision{cur}", format_func=LANE_CHOICE.get, disabled=revealed)
-    if b.button("Record decision", disabled=revealed):
-        append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
-                        model_version=R["meta"]["model_version"], sensors=SENSORS, wood_lab=WOOD_LAB,
-                        wood_reject=WOOD_REJECT, peanut_limit=PEANUT, walnut_limit=WALNUT, recommended=row.lane,
-                        labels=label_text(row), decision=decision, override=decision != row.lane,
-                        sent_to_lab=decision in (V.LAB_WOOD, V.LAB_PURE), user=USER))
-        if decision in (V.LAB_WOOD, V.LAB_PURE):
-            ss.setdefault("queue", []).append(
-                dict(sample=f"#{cur:04d}", reason=LANE[decision]["text"], chance_of_filler=float(row.p_any)))
-        ss.recorded[cur] = decision
-        st.rerun()
-    if decision != row.lane and not revealed:
-        st.warning(f"This overrides the recommendation ({LANE_CHOICE[row.lane]}). The override is recorded under your name.")
-    if revealed:
-        st.success(f"Decision recorded for this sample: {LANE_CHOICE[ss.recorded[cur]]}.")
+    with left.container(border=True):
+        decision = st.radio("Your decision", V.LANES, index=V.LANES.index(ss.recorded.get(cur, row.lane)),
+                            key=f"decision{cur}", format_func=LANE_CHOICE.get, disabled=revealed)
+        if st.button("Record decision", disabled=revealed, width="stretch"):
+            append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
+                            model_version=R["meta"]["model_version"], sensors=SENSORS, wood_lab=WOOD_LAB,
+                            wood_reject=WOOD_REJECT, peanut_limit=PEANUT, walnut_limit=WALNUT, recommended=row.lane,
+                            labels=label_text(row), decision=decision, override=decision != row.lane,
+                            sent_to_lab=decision in (V.LAB_WOOD, V.LAB_PURE), user=USER))
+            if decision in (V.LAB_WOOD, V.LAB_PURE):
+                ss.setdefault("queue", []).append(
+                    dict(sample=f"#{cur:04d}", reason=LANE[decision]["text"], chance_of_filler=float(row.p_any)))
+            ss.recorded[cur] = decision
+            st.rerun()
+        if decision != row.lane and not revealed:
+            st.warning(f"This overrides the recommendation ({LANE_CHOICE[row.lane]}). The override is recorded under your name.")
+        if revealed:
+            st.success(f"Decision recorded for this sample: {LANE_CHOICE[ss.recorded[cur]]}.")
 
-    with st.expander("③ Details and reasoning"):
+    with st.expander("3 · Details and reasoning"):
         st.markdown(f"**Why {LANE[row.lane]['title']}:** {reason(row)}")
         st.markdown("**How the verdict was reached**")
         decision_path(row)
@@ -664,7 +811,7 @@ def page_inspect():
 
     with st.expander("How to read this page"):
         st.markdown(
-            "1. Press **Next ▶** for a new sample, **◀ Previous** to go back. The screen compares the photo and colour reading with the supplier's reference.\n"
+            "1. Press **Next** for a new sample, **Previous** to go back. The screen compares the photo and colour reading with the supplier's reference.\n"
             "2. It works out the chance that each filler is present and gives one verdict:\n"
             f"   - {LANE_CHOICE[V.REJECT]}: wood dust above the reject limit. Discard the lot.\n"
             f"   - {LANE_CHOICE[V.LAB_WOOD]}: wood dust above the lab limit. Confirm before any use.\n"
@@ -682,7 +829,7 @@ def page_inspect():
             cap = st.number_input("Lab capacity (checks per week)", 1, 500, 10)
             q = pd.DataFrame(queue).sort_values("chance_of_filler", ascending=False)
             if len(q) > cap:
-                st.error(f"⚠ {len(q)} samples are queued and the lab takes {cap}.")
+                st.error(f"{len(q)} samples are queued and the lab takes {cap}.")
             st.dataframe(q, hide_index=True, width="stretch", column_config={"chance_of_filler": st.column_config.ProgressColumn(
                 "Chance of any filler", format="percent", min_value=0, max_value=1)})
 
@@ -697,18 +844,18 @@ def page_inspect():
 WORKFLOW_DOT = """
 digraph {
   rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.32;
-  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, color="#9c9a92",
-        fillcolor="#f1efe8", fontcolor="#2c2c2a", margin="0.12,0.06"];
-  edge [color="#9c9a92", fontname="Helvetica", fontsize=9, fontcolor="#888780"];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, color="#CFC4B4",
+        fillcolor="#FFFFFF", fontcolor="#231C17", margin="0.16,0.09", penwidth=1.2];
+  edge [color="#A89C8D", fontname="Helvetica", fontsize=9, fontcolor="#6F655C", arrowsize=0.7];
   lot [label="1. Lot arrives\nfrom a supplier"];
   sample [label="2. Take a sample\nphoto + colour reading"];
   ref [label="3. Compare with that\nsupplier's reference"];
   models [label="4. Models estimate the\nchance of each filler"];
   rules [label="5. Verdict rules\n(limits in the sidebar)"];
-  reject [label="Reject\ndiscard the lot", fillcolor="#f7c1c1", fontcolor="#501313", color="#a32d2d"];
-  labw [label="Lab: wood risk\nconfirm before use", fillcolor="#fac775", fontcolor="#412402", color="#854f0b"];
-  label [label="Label\npeanut and/or walnut", fillcolor="#b5d4f4", fontcolor="#042c53", color="#185fa5"];
-  labp [label="Lab: verify pure", fillcolor="#faeeda", fontcolor="#412402", color="#854f0b"];
+  reject [label="Reject\ndiscard the lot", fillcolor="#F6D9D6", fontcolor="#5C120E", color="#B3261E"];
+  labw [label="Lab: wood risk\nconfirm before use", fillcolor="#FBE3CB", fontcolor="#4A2503", color="#E0761B"];
+  label [label="Label\npeanut and/or walnut", fillcolor="#D8E5F8", fontcolor="#0C2C5E", color="#1F5FBF"];
+  labp [label="Lab: verify pure", fillcolor="#FBF0C4", fontcolor="#4A3A03", color="#C99A06"];
   record [label="6. Inspector decides\nand records it"];
   result [label="7. Lab result\non file"];
   {rank=same; lot; sample; ref;}
@@ -722,6 +869,16 @@ digraph {
   result -> ref [style=dashed, constraint=false, tooltip="Confirmed lots build the supplier's track record"];
 }
 """
+# Dark-theme colours for the diagram: each light colour and its replacement.
+DOT_DARK = {"#CFC4B4": "#4A4038", "#FFFFFF": "#211B17", "#231C17": "#EEE7DD", "#A89C8D": "#6F655C", "#6F655C": "#A99E92",
+            "#F6D9D6": "#4A1D1A", "#5C120E": "#F6D9D6", "#FBE3CB": "#4A2C12", "#4A2503": "#FBE3CB",
+            "#D8E5F8": "#1A2D4D", "#0C2C5E": "#D8E5F8", "#FBF0C4": "#45390D", "#4A3A03": "#FBF0C4"}
+
+
+def workflow_dot() -> str:
+    if not DARK:
+        return WORKFLOW_DOT
+    return re.sub("|".join(DOT_DARK), lambda m: DOT_DARK[m.group(0)], WORKFLOW_DOT)
 
 
 def before_after_chart():
@@ -745,16 +902,16 @@ def before_after_chart():
         for code, sym in zip(C.FOLDERS, ("circle", "diamond", "square")):
             m = (s.code == code).to_numpy() & pure & (~is_ref if x == "da" else True)
             fig.add_trace(go.Scatter(x=s[x][m], y=s[y][m], mode="markers", name=f"Pure, {TRUTH[code].lower()} supplier",
-                                     marker=dict(size=10, symbol=sym, color="#2c2c2a", line=dict(color="white", width=1.5)),
+                                     marker=dict(size=10, symbol=sym, color=INK, line=dict(color=PAPER, width=1.5)),
                                      hovertemplate=f"Pure cinnamon, {TRUTH[code].lower()} supplier<extra></extra>"))
         if x == "da":
             fig.add_trace(go.Scatter(x=[0], y=[0], mode="markers", name="The supplier's reference",
-                                     marker=dict(size=16, symbol="star", color="#eda100", line=dict(color="white", width=1.5)),
+                                     marker=dict(size=16, symbol="star", color=AMBER, line=dict(color=INK, width=1)),
                                      hovertemplate="Reference<extra></extra>"))
         with col:
             chart(fig, 380, title=title, xaxis=dict(title=xt, zeroline=False), yaxis=dict(title=yt, zeroline=False),
                   legend=dict(orientation="h", y=-0.25, font=dict(size=11)))
-    st.caption("Each dot is one sample's colorimeter reading. **Left:** the three pure batches (dark shapes) sit far "
+    st.caption("Each dot is one sample's colorimeter reading. **Left:** the three pure batches (large shapes) sit far "
                "apart, so there is no single “pure cinnamon” colour to learn. **Right:** the same readings measured from "
                "each supplier's own reference (star). Every pure batch now lands on the star, so “how far from this "
                "supplier's normal” means the same thing for every supplier. Peanut-shell and wood-dust blends sit clearly "
@@ -764,11 +921,11 @@ def before_after_chart():
 
 def page_how():
     st.title("How it works")
-    st.info("**In one sentence:** the screen checks each delivery against a known-pure sample from the same supplier, "
-            "estimates the chance of each filler, and turns that into one of four verdicts. It supplements lab "
-            "testing; it does not replace it.")
+    plain("The screen checks each delivery against a known-pure sample from the same supplier, estimates the chance "
+          "of each filler, and turns that into one of four verdicts. It supplements lab testing; it does not replace it.",
+          label="In one sentence")
     st.subheader("1 · The workflow")
-    st.graphviz_chart(WORKFLOW_DOT, width="content")
+    st.graphviz_chart(workflow_dot(), width="content")
     st.markdown(
         "1. **A lot arrives** from a supplier whose pure reference sample is already on file.\n"
         "2. **A small sample is ground and measured:** one photo in a dish and one colorimeter reading. No lab needed.\n"
@@ -859,14 +1016,14 @@ def page_compare():
         st.success(f"Both samples get the same verdict: **{LANE_CHOICE[ra.lane]}**.")
     else:
         st.warning(f"The verdicts differ: sample A gets **{LANE_CHOICE[ra.lane]}**, sample B gets **{LANE_CHOICE[rb.lane]}**.")
-    left, right = st.columns([1.25, 1], gap="large")
+    left, right = st.columns([1.35, 1], gap="large")
     with left:
-        st.dataframe(styled({"Sample A": sample_rows(ra, sa, ca, True, extras=True),
-                             "Sample B": sample_rows(rb, sb, cb, True, extras=True)}), width="stretch")
+        sample_table({"Sample A": sample_rows(ra, sa, ca, True, extras=True),
+                      "Sample B": sample_rows(rb, sb, cb, True, extras=True)})
     with right:
         fig = go.Figure()
         names = ["Peanut shell", "Walnut shell", "Wood dust"]
-        for name, row, colr in (("Sample A", ra, "#2a78d6"), ("Sample B", rb, "#eb6834")):
+        for name, row, colr in (("Sample A", ra, INK), ("Sample B", rb, BRAND)):
             vals = [row.p_peanut, row.p_walnut, row.p_wood]
             fig.add_trace(go.Bar(y=names, x=vals, orientation="h", name=name, marker_color=colr,
                                  text=[pct(v, 0) for v in vals], textposition="outside", cliponaxis=False,
@@ -877,13 +1034,13 @@ def page_compare():
 
 
 # ---------------------------------------------------------------- Scoreboard
-OUTCOME_ORDER = ["✕ Reject", "⚠ Lab (wood risk)", "🏷 Label peanut", "🏷 Label walnut", "🏷 Label both", "⧖ Lab (verify pure)"]
+OUTCOME_ORDER = ["✕ Reject", "▲ Lab (wood risk)", "◆ Label peanut", "◆ Label walnut", "◆ Label both", "○ Lab (verify pure)"]
 
 
 def outcome_name(row) -> str:
     if row.lane == V.LABEL:
-        return "🏷 Label both" if row.label_peanut and row.label_walnut else (
-            "🏷 Label peanut" if row.label_peanut else "🏷 Label walnut")
+        return "◆ Label both" if row.label_peanut and row.label_walnut else (
+            "◆ Label peanut" if row.label_peanut else "◆ Label walnut")
     return LANE_CHOICE[row.lane]
 
 
@@ -894,8 +1051,19 @@ def verdict_crosstab(df: pd.DataFrame) -> pd.DataFrame:
                      columns=[c for c in OUTCOME_ORDER if c in t.columns], fill_value=0)
 
 
-OUTCOME_COLOUR = {"✕ Reject": "#d03b3b", "⚠ Lab (wood risk)": "#ec835a", "🏷 Label peanut": "#2a78d6",
-                  "🏷 Label walnut": "#6250d6", "🏷 Label both": "#1baf7a", "⧖ Lab (verify pure)": "#fab219"}
+OUTCOME_COLOUR = {"✕ Reject": RED, "▲ Lab (wood risk)": ORANGE, "◆ Label peanut": BLUE,
+                  "◆ Label walnut": "#5B4BC4", "◆ Label both": "#12897A", "○ Lab (verify pure)": AMBER}
+
+
+def count_table(ct: pd.DataFrame):
+    """The verdict table: truth in rows, verdict in columns. Headers wrap, so it never needs a sideways scroll."""
+    head = "".join(f'<th><span class="ep-dot" style="--c:{OUTCOME_COLOUR[c]}"></span>{esc(c.split(" ", 1)[1])}</th>' for c in ct.columns)
+    body = "".join(
+        f'<tr><td class="k">{esc(truth)}</td>'
+        + "".join(f'<td class="v {"some" if n else "zero"}">{int(n):,}</td>' for n in vals) + "</tr>"
+        for truth, vals in zip(ct.index, ct.to_numpy()))
+    st.html(f'<table class="ep-table counts"><thead><tr><th>{esc(ct.index.name)}</th>{head}</tr></thead>'
+            f"<tbody>{body}</tbody></table>")
 
 
 def verdict_bars(ct: pd.DataFrame):
@@ -904,7 +1072,7 @@ def verdict_bars(ct: pd.DataFrame):
     fig = go.Figure()
     for col in ct.columns:
         fig.add_trace(go.Bar(y=ct.index, x=share[col], name=col, orientation="h", marker_color=OUTCOME_COLOUR[col],
-                             marker_line=dict(color="rgba(0,0,0,0)", width=0), customdata=ct[col],
+                             marker_line=dict(color=PAPER, width=1.5), customdata=ct[col],
                              text=[pct(v, 0) if v >= 0.06 else "" for v in share[col]], textposition="inside",
                              hovertemplate="%{y} → " + col + ": %{customdata} samples (%{x:.0%})<extra></extra>"))
     chart(fig, 260, barmode="stack", bargap=0.35, title="What each kind of sample was told",
@@ -916,16 +1084,18 @@ def page_scoreboard():
     st.title("Scoreboard")
     st.caption(f"How the verdicts do on materials the models had never seen. Instruments: {SET_LABEL[SENSORS]} · limits: "
                f"wood lab {WOOD_LAB}%, wood reject {WOOD_REJECT}%, peanut {PEANUT}%, walnut {WALNUT}%.")
-    st.info("**In plain words:** each sample here was judged by models that had never seen that material, and compared "
-            "with its supplier's reference. Pure-cinnamon results are optimistic: the pure samples tested come from the "
-            "same batch as the reference.")
+    plain("Each sample here was judged by models that had never seen that material, and compared with its supplier's "
+          "reference. Pure-cinnamon results are optimistic: the pure samples tested come from the same batch as the "
+          "reference.")
     dev = VERD[VERD.pool == "dev"]
     m = V.summary(dev)
     good = m["wood_let_through"] == 0 and m["filler_missed"] == 0
-    st.markdown(f"### {'✓' if good else '⚠'} On materials it had never seen, the screen "
-                + (f"let no wood through and missed no filler. {pct(m['right'])} of verdicts were right." if good else
-                   f"let {pct(m['wood_let_through'])} of wood through and missed {pct(m['filler_missed'])} of filler. "
-                   f"{pct(m['right'])} of verdicts were right."))
+    headline = "On materials it had never seen, the screen " + (
+        f"let no wood through and missed no filler. {pct(m['right'])} of verdicts were right." if good else
+        f"let {pct(m['wood_let_through'])} of wood through and missed {pct(m['filler_missed'])} of filler. "
+        f"{pct(m['right'])} of verdicts were right.")
+    st.html(f'<div class="ep-card ep-hero" style="--c:{GREEN if good else ORANGE}"><div class="ep-hero-mark">'
+            f'{"✓" if good else "!"}</div><div class="ep-hero-text">{esc(headline)}</div></div>')
     st.subheader("1 · At a glance")
     cards = [
         ("Wood let through", m["wood_let_through"], m["wood_let_through"] == 0, "target 0%",
@@ -940,13 +1110,14 @@ def page_scoreboard():
          "Pure cinnamon that went to the lab to verify, rather than being flagged."),
         ("Verdicts right", m["right"], m["right"] >= 0.95, "target ≥ 95%", "All samples whose verdict matched what they are."),
     ]
-    for col, (name, v, ok, target, text) in zip(st.columns(len(cards)), cards):
-        col.metric(name, pct(v))
-        col.caption(f"{'✓' if ok else '✗'} {target}. {text}")
+    st.html('<div class="ep-kpis">' + "".join(
+        f'<div class="ep-kpi" style="--c:{GREEN if ok else RED}"><div class="ep-kpi-name">{esc(name)}</div>'
+        f'<div class="ep-kpi-val">{pct(v)}</div><span class="ep-chip">{"✓" if ok else "✗"} {esc(target)}</span>'
+        f'<div class="ep-kpi-text">{esc(text)}</div></div>' for name, v, ok, target, text in cards) + "</div>")
 
     st.subheader("2 · Every verdict, by what the sample really is")
     verdict_bars(verdict_crosstab(dev))
-    st.dataframe(verdict_crosstab(dev), width="stretch")
+    count_table(verdict_crosstab(dev))
     st.caption(f"{m['n']:,} samples from {m['materials']} materials. Rows are the truth, columns the verdict.")
 
     st.subheader("3 · Easy test against fair test")
@@ -958,14 +1129,14 @@ def page_scoreboard():
 
     st.subheader("4 · Final test: the locked materials")
     if not SCORED:
-        st.warning("🔒 **Not scored yet.** Levels 3%, 10% and 18% of every filler (9 materials, 450 samples) have never been "
+        st.warning("**Not scored yet.** Levels 3%, 10% and 18% of every filler (9 materials, 450 samples) have never been "
                    "used for training, tuning or any number on this page. They are scored once, at the end. Those are the "
                    "numbers to quote.")
         st.code(".venv/bin/python -m earnedpass.run_all --score-locked", language="bash")
     else:
         lk = VERD[VERD.pool == "locked"]
         st.success(f"Scored once at {R['meta']['locked_scored_at']}. These are the numbers to quote.")
-        st.dataframe(verdict_crosstab(lk), width="stretch")
+        count_table(verdict_crosstab(lk))
         lm = V.summary(lk)
         st.caption(f"Wood let through {pct(lm['wood_let_through'])} · filler missed {pct(lm['filler_missed'])} · "
                    f"verdicts right {pct(lm['right'])}.")
@@ -992,20 +1163,20 @@ def easy_vs_fair(rows: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- Evidence
 def tab_why_reference():
-    st.info("**In plain words:** the same verdict rules, run two ways. Compared with pure cinnamon in general, the "
-            "screen mistakes unfamiliar pure cinnamon for filler. Compared with each supplier's own reference sample, "
-            "it doesn't. That is why the screen always uses the supplier's reference.")
+    plain("The same verdict rules, run two ways. Compared with pure cinnamon in general, the screen mistakes unfamiliar "
+          "pure cinnamon for filler. Compared with each supplier's own reference sample, it doesn't. That is why the "
+          "screen always uses the supplier's reference.")
     gen = verdicts(STAMP, "general", SENSORS, TH)
     gen = gen[gen.pool == "dev"]
     a, b = st.columns(2, gap="large")
     with a:
         st.markdown("**Compared with pure cinnamon in general**")
-        st.dataframe(verdict_crosstab(gen), width="stretch")
+        count_table(verdict_crosstab(gen))
         st.caption(f"Verdicts right: {pct(V.summary(gen)['right'])}.")
     with b:
         st.markdown("**Compared with the supplier's reference**")
         sup = VERD[VERD.pool == "dev"]
-        st.dataframe(verdict_crosstab(sup), width="stretch")
+        count_table(verdict_crosstab(sup))
         st.caption(f"Verdicts right: {pct(V.summary(sup)['right'])}.")
     ns = R["reference"]["new_supplier"][SENSORS]
     st.markdown(
@@ -1017,9 +1188,8 @@ def tab_why_reference():
 
 
 def tab_blind_spot():
-    st.info("**In plain words:** each square is one material the screen had never seen. Green: at least 95% of its "
-            "samples got the right verdict. Red: fewer than half did. Grey in between. White squares are set aside for "
-            "the final test.")
+    plain("Each square is one material the screen had never seen. Green: at least 95% of its samples got the right "
+          "verdict. Red: fewer than half did. Grey in between. Pale squares are set aside for the final test.")
     d = VERD[VERD.pool == "dev"]
     share = d.assign(ok=d.result == "right").groupby(["code", "level"]).ok.mean()
     z, text = [], []
@@ -1035,8 +1205,8 @@ def tab_blind_spot():
                 tr.append("locked")
         z.append(zr)
         text.append(tr)
-    scale = [[0, "#0ca30c"], [0.25, "#0ca30c"], [0.25, "#c3c2b7"], [0.5, "#c3c2b7"], [0.5, "#d03b3b"], [0.75, "#d03b3b"],
-             [0.75, "#f0efec"], [1, "#f0efec"]]
+    scale = [[0, GREEN], [0.25, GREEN], [0.25, PAL["MID"]], [0.5, PAL["MID"]], [0.5, RED], [0.75, RED],
+             [0.75, PAL["LOCKED"]], [1, PAL["LOCKED"]]]
     fig = go.Figure(go.Heatmap(z=z, x=[f"{l}%" for l in C.LEVELS], y=[C.FOLDER_LABEL[c] for c in C.FOLDERS], text=text,
                                texttemplate="%{text}", colorscale=scale, zmin=0, zmax=4, showscale=False, xgap=3, ygap=3,
                                hovertemplate="%{y} at %{x}: %{text}<extra></extra>"))
@@ -1070,6 +1240,43 @@ def page_log():
     st.download_button("Download CSV", LOG.read_bytes(), "earned_pass_decision_log.csv", "text/csv")
 
 
+# ---------------------------------------------------------------- Dark mode
+# Streamlit keeps the chosen theme in the browser's localStorage, one key per page path, and
+# applies it on load. The toggle writes that key and reloads the page. New visitors get light.
+THEME_PATHS = ["/", "/inspect", "/how-it-works", "/compare", "/scoreboard", "/evidence", "/log"]
+
+
+def theme_script(mode: str | None) -> str:
+    """mode "Dark"/"Light": switch and reload. None: on first visit, settle on light.
+    Streamlit itself stores "System" on first load, so that counts as no choice yet."""
+    paths = json.dumps(THEME_PATHS)
+    return f"""<script>
+    const ls = window.parent.localStorage, here = window.parent.location.pathname;
+    const keys = [...new Set([...{paths}, here])].map(p => `stActiveTheme-${{p}}-v2`);
+    const mode = {json.dumps(mode)};
+    if (mode) {{
+      keys.forEach(k => ls.setItem(k, JSON.stringify(mode)));
+      window.parent.location.reload();
+    }} else if ([null, '"System"'].includes(ls.getItem(`stActiveTheme-${{here}}-v2`))) {{
+      keys.forEach(k => ls.setItem(k, JSON.stringify("Light")));
+      if ({json.dumps(DARK)}) window.parent.location.reload();
+    }}
+    </script>"""
+
+
+def theme_toggle():
+    ss = st.session_state
+    with st.container(key="theme_bar"):
+        st.toggle("Dark mode", value=DARK, key="dark_mode", on_change=lambda: ss.update(theme_switch=True))
+    if ss.pop("theme_switch", False):
+        components.html(theme_script("Dark" if ss.dark_mode else "Light"), height=0)
+    elif not ss.get("theme_checked"):
+        ss.theme_checked = True
+        components.html(theme_script(None), height=0)
+
+
+theme_toggle()
+
 st.navigation([
     st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
     st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works"),
@@ -1077,4 +1284,4 @@ st.navigation([
     st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
     st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
     st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"),
-]).run()
+], position="top").run()
