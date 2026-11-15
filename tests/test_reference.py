@@ -1,7 +1,7 @@
 import numpy as np
 
 from earnedpass import config as C
-from earnedpass import decide, models, reference
+from earnedpass import models, reference, verdict
 from tests.test_pipeline import synthetic
 
 
@@ -25,10 +25,9 @@ def test_reference_run_never_screens_reference_or_locked_rows():
         assert np.isfinite(out[k][:, screened]).all(), k
         assert np.isnan(out[k][:, is_ref | locked]).all(), k
     assert np.isnan(out["pl"]).all() and np.isnan(out["el"]).all()  # locked cells untouched
-    probs = decide.Probs(out["p1"][0], out["p3"][0], out["pl"][0])
-    res = decide.evaluate(s, probs, decide.Settings())
-    assert not res.df.row.isin(np.flatnonzero(is_ref)).any()
-    assert len(res.df) == screened.sum()
+    df = verdict.screened(s, (out["p3"][0], out["pl"][0]), (out["t3"][0], out["tl"][0]), verdict.Thresholds())
+    assert not df.row.isin(np.flatnonzero(is_ref)).any()
+    assert len(df) == screened.sum()
     assert set(out["new_supplier"]) == set(C.SENSOR_SETS)
 
 

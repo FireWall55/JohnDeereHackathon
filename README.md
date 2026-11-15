@@ -37,13 +37,23 @@ Set `EARNEDPASS_DATA` to point somewhere else.
 
 ## The app
 
+What an inspector sees:
+
 | Page | What it shows |
 |---|---|
-| Inspect | One sample: verdict card, chance of each filler against its limit, amount estimate, ground truth with a right/wrong check, colour readings. Record your own decision. |
-| Compare | Two samples side by side. |
+| Inspect | One sample at a time (Previous / Next): the verdict, the chance of each filler against its limit, the amount estimate, details of how the verdict was reached. Record your own decision; lots sent to the lab go in a queue. |
+| How it works | The workflow, why every sample is compared with its supplier's reference, and how to bring on a new supplier or a new kind of cinnamon. |
+| Log | Every recorded decision with the limits in force. |
+
+**Developer view** (switch at the bottom of the sidebar, off by default) adds what only the team and the judges
+should see: ground truth and a "Was the screen right?" card on Inspect, demo controls, notes on how far to trust the
+result, the held-out-supplier results on How it works, the true material in the Log, and three extra pages:
+
+| Page | What it shows |
+|---|---|
+| Compare | Two samples side by side, chosen by their true material. |
 | Scoreboard | Fair-test results: wood let through, filler missed, nut labels, pure sent to verify, the full verdict table, easy-vs-fair, and the locked-cell final test. |
 | Evidence | Why the supplier reference is used, blind-spot map, Replicate Radar, stress ladder, sanity checks. |
-| Log | Every recorded decision with the limits in force. |
 
 ## How results are tested
 
@@ -81,11 +91,8 @@ A second run is refused unless you pass `--force`.
 | `earnedpass/verdict.py` | The team's verdict rules, chance-present calculation, right/wrong judging and summary numbers. |
 | `earnedpass/eval/splits.py`, `ladder.py` | Split rungs and the stress ladder (easy vs fair). |
 | `earnedpass/audit.py`, `controls.py` | Replicate Radar; session probe, zero-filler probe, offset test, band check. |
-| `earnedpass/run_all.py` | Runs everything and writes `artifacts/results.json`, the numbers registry. |
-| `app.py` | The Streamlit app. |
-
-`earnedpass/decide.py`, `eval/conformal.py`, `eval/bounds.py` and `scoreboard.py` belong to the earlier PASS/LAB/HOLD
-design. The app no longer uses them; `run_all.py` still writes their results into `results.json`.
+| `earnedpass/run_all.py` | Runs everything and writes `artifacts/results.json`, the numbers registry. Its `verdicts` section holds the default-limit verdict numbers for every instrument set, in supplier-reference and general mode. |
+| `app.py`, `.streamlit/config.toml` | The Streamlit app and its light and dark themes. |
 
 ## Still assumed
 

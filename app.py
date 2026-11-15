@@ -262,8 +262,7 @@ with st.sidebar:
         if EXPLAIN:
             st.caption(text)
 
-    st.caption("**Compared with:** each supplier's own reference sample. Note that the pure samples tested come from "
-               "the same batch as the reference, so results on pure cinnamon are optimistic.")
+    st.caption("**Compared with:** each supplier's own reference sample.")
     SENSORS = st.selectbox("Instruments used for screening", list(C.SENSOR_SETS), index=list(C.SENSOR_SETS).index(C.SCREEN_SET),
                            format_func=SET_LABEL.get)
     note("A colorimeter and a camera are what an inspector has at the receiving dock. FTIR is a lab instrument.")
@@ -284,8 +283,15 @@ with st.sidebar:
     note("Written into the decision log next to every decision you record.")
     st.divider()
     st.caption("The tool recommends; the inspector decides. It supplements lab testing, it does not replace it.")
-    st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"] if SCORED
-               else "locked cells (levels 3, 10, 18) not scored yet"))
+    st.divider()
+    DEV = st.toggle("Developer view", False, key="dev_view",
+                    help="For the team and the judges: ground truth, demo controls, and the Compare, Scoreboard and "
+                         "Evidence pages. An inspector never sees these.")
+    if DEV:
+        st.caption("Developer view is on. The pure samples tested come from the same batch as the reference, so "
+                   "results on pure cinnamon are optimistic.")
+        st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"]
+                   if SCORED else "locked cells (levels 3, 10, 18) not scored yet"))
 
 TH = V.Thresholds(WOOD_LAB / 100, WOOD_REJECT / 100, PEANUT / 100, WALNUT / 100)
 VERD = verdicts(STAMP, "supplier", SENSORS, TH)
@@ -573,7 +579,7 @@ def sample_rows(row, smp, cur, show_truth, extras=False):
         rows["Amount estimate was"] = f"{'✓' if off <= m else '✗'} off by {off:.0f} points"
         colours["Verdict was"] = check_colour(rows["Verdict was"])
         colours["Amount estimate was"] = check_colour(rows["Amount estimate was"])
-    else:
+    elif DEV:
         rows["Ground truth"] = "hidden until you record a decision"
     if extras:
         rows["Chance of any filler"] = pct(row.p_any, 0)
@@ -625,8 +631,10 @@ def truth_html(row, smp, show) -> str:
 
 
 def verdict_row(row, smp, show_truth):
-    """Verdict and truth side by side, in one block so the two cards share a height."""
-    st.html(f'<div class="ep-row">{verdict_html(row, eyebrow="1 · The verdict")}{truth_html(row, smp, show_truth)}</div>')
+    """Verdict and truth side by side, in one block so the two cards share a height.
+    Outside developer view the inspector sees only the verdict: they never know the answer."""
+    truth = truth_html(row, smp, show_truth) if DEV else ""
+    st.html(f'<div class="ep-row">{verdict_html(row, eyebrow="1 · The verdict")}{truth}</div>')
 
 
 def append_log(row: dict):
@@ -756,9 +764,10 @@ def page_inspect():
     a.button("Previous", icon=":material/arrow_back:", on_click=go_prev, disabled=ss.pos == 0, width="stretch")
     b.button("Next", icon=":material/arrow_forward:", on_click=go_next, type="primary", width="stretch")
     c.markdown(f"Sample **{ss.pos + 1}** of **{len(ss.hist)}** viewed")
-    show_truth = d.toggle("Show ground truth", True, help="What the dataset says the sample really is, and whether the "
-                          "verdict was right. Turn off to screen blind; it then appears after you record a decision.")
-    truth_visible = show_truth or revealed
+    show_truth = DEV and d.toggle("Show ground truth", True, help="What the dataset says the sample really is, and "
+                                  "whether the verdict was right. Turn off to screen blind; it then appears after you "
+                                  "record a decision.")
+    truth_visible = DEV and (show_truth or revealed)
 
     verdict_row(row, smp, truth_visible)
 
@@ -806,8 +815,9 @@ def page_inspect():
         est, m = level_estimate(cur)
         st.caption(f"The estimated amount comes from a separate model. On materials it had not seen, it was within "
                    f"±{m:.0f} points of the truth for 8 samples in 10.")
-        st.markdown("**How far to trust it**")
-        how_far_to_trust()
+        if DEV:
+            st.markdown("**How far to trust it** (developer view)")
+            how_far_to_trust()
 
     with st.expander("How to read this page"):
         st.markdown(
@@ -818,8 +828,7 @@ def page_inspect():
             f"   - {LANE_CHOICE[V.LABEL]}: peanut or walnut shell above its limit. Label the lot; both can apply.\n"
             f"   - {LANE_CHOICE[V.LAB_PURE]}: nothing above its limit. The lab verifies it is pure.\n"
             "3. The limits are in the sidebar.\n"
-            "4. **Ground truth** shows what the sample really is and whether the verdict was right.\n"
-            "5. Choose your own decision and record it.")
+            "4. Choose your own decision and record it. Lots sent to the lab appear in the lab queue below.")
 
     queue = st.session_state.get("queue", [])
     with st.expander(f"Lab queue this session ({len(queue)})"):
@@ -833,7 +842,12 @@ def page_inspect():
             st.dataframe(q, hide_index=True, width="stretch", column_config={"chance_of_filler": st.column_config.ProgressColumn(
                 "Chance of any filler", format="percent", min_value=0, max_value=1)})
 
-    with st.expander("Demo controls"):
+    if DEV:
+        demo_controls(df)
+
+
+def demo_controls(df):
+    with st.expander("Demo controls (developer view)"):
         cells = ["Any material"] + sorted(df.cell.unique(), key=lambda c: (c[1], int(c[2:])))
         st.selectbox("Draw the next sample from", cells, key="demo_pick",
                      format_func=lambda c: c if c == "Any material" else cell_name(c),
@@ -919,6 +933,19 @@ def before_after_chart():
                "what separate those, which is why the screen uses colour and photo together.")
 
 
+def new_supplier_table(ns):
+    st.markdown("**How well this carries over, on this dataset** (developer view). Each supplier was held out "
+                "completely: the models never saw its samples and were given only its reference.")
+    rows = []
+    for ss in ("colour+image", "all", "colour", "ftir"):
+        v = ns[ss]
+        rows.append({"Instruments": SET_LABEL[ss], "Blends flagged": pct(v["blends_flagged"], 0),
+                     "Pure samples recognised": pct(v["pure_recognised"], 0),
+                     "Blends flagged, by supplier": ", ".join(f"{TRUTH[c].split()[0]} {pct(x['blends_flagged'], 0)}"
+                                                             for c, x in v["by_supplier"].items())})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
 def page_how():
     st.title("How it works")
     plain("The screen checks each delivery against a known-pure sample from the same supplier, estimates the chance "
@@ -953,16 +980,8 @@ def page_how():
         "4. **Check early lots at the lab too.** Each confirmed lot adds to the supplier's track record.\n"
         "5. **A different kind of cinnamon** (for example cassia instead of Ceylon) gets its own reference, "
         "even from the same supplier.")
-    st.markdown("**How well this carries over, on this dataset.** Each supplier was held out completely: the models "
-                "never saw its samples and were given only its reference.")
-    rows = []
-    for ss in ("colour+image", "all", "colour", "ftir"):
-        v = ns[ss]
-        rows.append({"Instruments": SET_LABEL[ss], "Blends flagged": pct(v["blends_flagged"], 0),
-                     "Pure samples recognised": pct(v["pure_recognised"], 0),
-                     "Blends flagged, by supplier": ", ".join(f"{TRUTH[c].split()[0]} {pct(x['blends_flagged'], 0)}"
-                                                             for c, x in v["by_supplier"].items())})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    if DEV:
+        new_supplier_table(ns)
     st.warning(
         "**What this does not prove yet.**\n"
         "- The dataset has only three suppliers' pure batches, so “works for other cinnamon” is promising, not shown.\n"
@@ -1235,7 +1254,8 @@ def page_log():
     a.metric("Decisions", len(log))
     b.metric("Overrides", int(log.override.sum()))
     c.metric("Sent to lab", int(log.sent_to_lab.sum()))
-    log.insert(2, "material", log.sample_id.map(cell_name))
+    if DEV:
+        log.insert(2, "material (developer view)", log.sample_id.map(cell_name))
     st.dataframe(log.iloc[::-1], hide_index=True, width="stretch")
     st.download_button("Download CSV", LOG.read_bytes(), "earned_pass_decision_log.csv", "text/csv")
 
@@ -1277,11 +1297,11 @@ def theme_toggle():
 
 theme_toggle()
 
-st.navigation([
-    st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
-    st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works"),
-    st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
-    st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
-    st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
-    st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"),
-], position="top").run()
+PAGES = [st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
+         st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works")]
+if DEV:  # evaluation pages: for the team and the judges
+    PAGES += [st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
+              st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
+              st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence")]
+PAGES.append(st.Page(page_log, title="Log", icon=":material/list_alt:", url_path="log"))
+st.navigation(PAGES, position="top").run()

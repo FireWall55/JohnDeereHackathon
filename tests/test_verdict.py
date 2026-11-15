@@ -52,7 +52,6 @@ def test_judge():
 def test_screened_skips_rows_without_predictions():
     s = pd.DataFrame({"sample_id": list("abcd"), "cell": ["CP0", "CP6", "CD6", "CW6"], "code": list("PPDW"),
                       "level": [0, 6, 6, 6], "locked": [False, False, False, True]})
-    nan = np.full(4, np.nan)
     p3 = np.array([[0.9, 0.1, 0, 0], [0, 0, 1, 0], [np.nan] * 4, [0, 0, 1, 0]])
     t3 = np.array([[1, 0, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=float)
     df = V.screened(s, (p3, np.full((4, 4), np.nan)), (t3, np.full((4, 3), np.nan)), V.Thresholds())
