@@ -5,3 +5,6 @@ __pycache__/
 # heavy, rebuilt by `python -m earnedpass.run_all`
 artifacts/*
 !artifacts/results.json
+
+# suppliers registered in the app (local only)
+user_data/

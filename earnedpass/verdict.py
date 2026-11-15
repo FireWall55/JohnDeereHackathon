@@ -6,7 +6,7 @@ For each filler the screen computes the chance it is present:
                      x chance it is this filler, given there is one (filler model)
 
 Rules, each threshold adjustable:
-- Wood dust above the reject limit (default 10%): REJECT, discard.
+- Wood dust above the reject limit (default 2%): REJECT, discard.
 - Wood dust above the lab limit (default 1%): LAB, wood risk, confirm before use.
 - Peanut shell above its limit (default 10%): LABEL as containing peanut shell.
 - Walnut shell above its limit (default 10%): LABEL as containing walnut shell.
@@ -31,7 +31,7 @@ P, W, D = (list(C.FOLDERS).index(c) for c in ("P", "W", "D"))
 @dataclass(frozen=True)
 class Thresholds:
     wood_lab: float = 0.01
-    wood_reject: float = 0.10
+    wood_reject: float = 0.02
     peanut: float = 0.10
     walnut: float = 0.10
 

@@ -43,10 +43,6 @@ RUNG_LABEL = {
     "4_leave_folder_out": "4 · leave-one-folder-out",
 }
 
-# Defaults the QC manager can change in the app. Illustrative, not regulatory.
-ALPHA = 0.10
-MUST_CATCH = 6
-PASS_BAR = 0.90
 SEED = 0
 
 

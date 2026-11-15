@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from earnedpass import config as C
-from earnedpass import decide, models, run_all
+from earnedpass import models, run_all, verdict
 from earnedpass.data import Data
 
 
@@ -41,12 +41,13 @@ def test_pipeline_with_locked_scoring():
     assert r[(r.rung == "4_leave_folder_out") & (r.task == "type")].empty
     assert (r[r.section == "locked"].n_cells.isin([9])).all()
 
-    probs = {ss: decide.Probs(p1[i], p3[i], pl[i]) for i, ss in enumerate(C.SENSOR_SETS)}
-    summary = run_all.decision_summary(d.samples, rows, probs)
-    res = decide.evaluate(d.samples, probs[C.SCREEN_SET], decide.Settings())
-    assert res.pools == ("dev", "locked") and len(res.df) == len(d.samples)
-    assert res.claims["catch"]["cells"]["n"] == 24 and res.claims["reference"]["cells"]["n"] == 3
-    assert not summary[C.SCREEN_SET]["replicate_aware"]["licence"]["licensed"]  # three 0% cells cap claim 2 at 36.8%
+    t3, tl = run_all.type_probabilities(d, sp, score_locked=True)
+    i = list(C.SENSOR_SETS).index(C.SCREEN_SET)
+    df = verdict.screened(d.samples, (p3[i], pl[i]), (t3[i], tl[i]), verdict.Thresholds())
+    assert set(df.pool) == {"dev", "locked"} and len(df) == len(d.samples)
+    assert set(df.lane) <= set(verdict.LANES)
+    summary = run_all.verdict_summary(d.samples, {C.SCREEN_SET: {"band": (p3[i], pl[i]), "types": (t3[i], tl[i])}})
+    assert summary[C.SCREEN_SET]["summary"]["n"] == int((~d.samples.locked).sum())  # open materials only
 
 
 def test_type_probabilities_cover_held_out_samples_only():
@@ -76,6 +77,7 @@ def test_level_estimates_cover_held_out_samples_only():
 def test_unscored_locked_pool_is_refused():
     d = synthetic(reps=6)
     rows, p1, p3, pl = run_all.model_all(d, models.Spectra(d.X_ftir), log=lambda *_: None)
-    probs = decide.Probs(p1[0], p3[0], pl[0])
-    assert not probs.locked_scored
-    assert decide.evaluate(d.samples, probs, decide.Settings()).pools == ("dev",)
+    t3, tl = run_all.type_probabilities(d, models.Spectra(d.X_ftir))
+    assert np.isnan(pl).all() and np.isnan(tl).all()
+    df = verdict.screened(d.samples, (p3[0], pl[0]), (t3[0], tl[0]), verdict.Thresholds())
+    assert set(df.pool) == {"dev"}  # locked materials are never screened before the final run

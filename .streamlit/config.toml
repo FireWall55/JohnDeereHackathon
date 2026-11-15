@@ -1,0 +1,54 @@
+# Look of the Earned Pass app: a light and a dark theme, switched with the
+# "Dark mode" toggle at the top of every page. Component styles live in app.py
+# (CSS); its LIGHT and DARK palettes must match the colours here.
+
+[theme]
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "0.6rem"
+buttonRadius = "0.55rem"
+font = "sans-serif"
+headingFont = "serif"
+headingFontWeights = 600
+baseFontSize = 16
+chartCategoricalColors = ["#1F5FBF", "#D9641E", "#1E9E6F", "#5B4BC4", "#EAB308", "#B3261E"]
+
+[theme.light]
+base = "light"
+primaryColor = "#231C17"
+backgroundColor = "#FBF8F3"
+secondaryBackgroundColor = "#F2ECE3"
+textColor = "#231C17"
+linkColor = "#8F3F1B"
+borderColor = "#E2D9CB"
+dataframeBorderColor = "#E2D9CB"
+dataframeHeaderBackgroundColor = "#F5F0E8"
+redColor = "#B3261E"
+orangeColor = "#E0761B"
+yellowColor = "#EAB308"
+greenColor = "#1D7A46"
+blueColor = "#1F5FBF"
+
+[theme.light.sidebar]
+backgroundColor = "#F5F0E8"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+base = "dark"
+primaryColor = "#C8622F"
+backgroundColor = "#16120F"
+secondaryBackgroundColor = "#26201B"
+textColor = "#EEE7DD"
+linkColor = "#E89A6C"
+borderColor = "#3B332C"
+dataframeBorderColor = "#3B332C"
+dataframeHeaderBackgroundColor = "#221C17"
+redColor = "#E5484D"
+orangeColor = "#F0883E"
+yellowColor = "#EAB308"
+greenColor = "#3FB27F"
+blueColor = "#5B8FE8"
+
+[theme.dark.sidebar]
+backgroundColor = "#1C1713"
+secondaryBackgroundColor = "#26201B"

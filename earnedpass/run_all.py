@@ -14,22 +14,15 @@ import json
 import subprocess
 
 import numpy as np
+import pandas as pd
 
-from . import audit, controls, data as data_mod, decide, models, reference
+from . import audit, controls, data as data_mod, models, reference, verdict
 from . import config as C
 from .eval import ladder, splits
-from .eval.bounds import cp_lower, units_needed
-from .eval.conformal import min_alpha
 
 PROBS = C.ARTIFACTS / "band_probs.npz"
 PROBS_REF = C.ARTIFACTS / "band_probs_reference.npz"
 RESULTS = C.ARTIFACTS / "results.json"
-
-
-def load_probs(sensor_set) -> decide.Probs:
-    z = np.load(PROBS, allow_pickle=False)
-    i = list(z["sets"]).index(sensor_set)
-    return decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i])
 
 
 def _git_sha() -> str:
@@ -39,35 +32,17 @@ def _git_sha() -> str:
         return ""
 
 
-def decision_summary(samples, rows, probs_by_set) -> dict:
-    """Default-setting decision results for every sensor set and both modes."""
-    summary = {}
-    for ss, probs in probs_by_set.items():
-        for mode in decide.MODES:
-            res = decide.evaluate(samples, probs, decide.Settings(mode=mode, sensor_set=ss))
-            base = dict(section="decision", task="band", sensor_set=ss, rung="3_leave_cell_out", mode=mode,
-                        n_samples=res.metrics["n_samples"], n_cells=res.metrics["n_cells"])
-            for k, v in res.metrics.items():
-                if k not in ("n_samples", "n_cells"):
-                    rows.append({**base, "metric": k, "value": float(v)})
-            for who, b in (("b1_held_out_cells", res.baseline), ("b1_sample_id_split", res.baseline_sample_split)):
-                for k, v in b.items():
-                    if k not in ("n_samples", "n_cells"):
-                        rows.append({**base, "rung": "1_sample_id" if "sample_id" in who else base["rung"], "mode": "-",
-                                     "metric": f"{who}.{k}", "value": float(v), "n_samples": b["n_samples"], "n_cells": b["n_cells"]})
-            for claim, counts in res.claims.items():
-                for unit, c in counts.items():
-                    rows.append({**base, "metric": f"claim_{claim}.{unit}.bound", "value": c["bound"],
-                                 "n_samples": c["n"] if unit == "samples" else None, "n_cells": c["n"] if unit == "cells" else None})
-            summary.setdefault(ss, {})[mode] = {
-                "licence": res.licence, "claims": res.claims, "metrics": res.metrics, "baseline": res.baseline,
-                "baseline_sample_split": res.baseline_sample_split,
-                "tiles": res.tiles[["code", "level", "PASS", "LAB", "HOLD", "status"]].to_dict("records"),
-                "pools": list(res.pools),
-            }
-        fb = decide.threshold_fallback(samples, probs, C.ALPHA, C.MUST_CATCH)
-        summary[ss]["threshold_fallback"] = fb
-    return summary
+def verdict_summary(samples, art: dict) -> dict:
+    """Default-limit verdict numbers for every sensor set, on the open materials (fair test)."""
+    out = {}
+    for ss, a in art.items():
+        df = verdict.screened(samples, a["band"], a["types"], verdict.Thresholds())
+        df = df[df.pool == "dev"]
+        truth = np.where(df.level == 0, "pure", df.code.map(C.FOLDER_LABEL))
+        counts = pd.crosstab(truth, df.lane)
+        out[ss] = {"summary": verdict.summary(df),
+                   "counts": {str(k): {str(c): int(v) for c, v in r.items()} for k, r in counts.iterrows()}}
+    return out
 
 
 def model_all(d, spectra, score_locked=False, log=print):
@@ -165,20 +140,17 @@ def main(argv=None) -> None:
     e3, el = level_estimates(d, spectra, score_locked=bool(args.score_locked or was_scored))
     np.savez_compressed(PROBS, sets=np.array(sets), p1=p1, p3=p3, pl=pl, t3=t3, tl=tl, e3=e3, el=el)
 
-    print("lanes, licence and blind-spot map...")
-    decision = decision_summary(s, rows, {ss: decide.Probs(p1[i], p3[i], pl[i]) for i, ss in enumerate(sets)})
-
     print("supplier-reference mode...")
     ref = reference.run(d, spectra, score_locked=bool(args.score_locked or was_scored))
     np.savez_compressed(PROBS_REF, sets=np.array(sets), **{k: ref[k] for k in ("p1", "p3", "pl", "t3", "tl", "e3", "el", "is_ref")})
-    ref_rows = []
-    ref_decision = decision_summary(s, ref_rows, {ss: decide.Probs(ref["p1"][i], ref["p3"][i], ref["pl"][i])
-                                                   for i, ss in enumerate(sets)})
-    for r in ref_rows:
-        r["section"] = "reference_decision"
-    rows += ref_rows
+    print("verdicts at the default limits...")
+    verdicts = {
+        "supplier_reference": verdict_summary(s, {ss: {"band": (ref["p3"][i], ref["pl"][i]), "types": (ref["t3"][i], ref["tl"][i])}
+                                                  for i, ss in enumerate(sets)}),
+        "general": verdict_summary(s, {ss: {"band": (p3[i], pl[i]), "types": (t3[i], tl[i])} for i, ss in enumerate(sets)}),
+        "limits": verdict.Thresholds().__dict__,
+    }
     reference_summary = {
-        "decision": ref_decision,
         "new_supplier": ref["new_supplier"],
         "split": {"reference_samples": {c: int((ref["is_ref"] & (s.code == c).to_numpy()).sum()) for c in C.FOLDERS},
                   "screened_pure_samples": {c: int((~ref["is_ref"] & (s.code == c).to_numpy() & (s.level == 0).to_numpy()).sum())
@@ -209,7 +181,7 @@ def main(argv=None) -> None:
             "locked_levels": C.LOCKED_LEVELS,
             "n_open": {"samples": int(len(dev)), "cells": int(s.cell.iloc[dev].nunique())},
             "n_locked": {"samples": int(len(locked)), "cells": int(s.cell.iloc[locked].nunique())},
-            "defaults": {"alpha": C.ALPHA, "must_catch": C.MUST_CATCH, "pass_bar": C.PASS_BAR, "screen_set": C.SCREEN_SET, "lab_set": C.LAB_SET},
+            "defaults": {"screen_set": C.SCREEN_SET, "lab_set": C.LAB_SET},
             "ftir_units_assumed": "transmittance (absorbance = -log10)",
         },
         "floor": {
@@ -217,17 +189,10 @@ def main(argv=None) -> None:
             "always_adulterated_plain_accuracy_open_cells": float(y.mean()),
             "always_adulterated_balanced_accuracy": 0.5,
         },
-        "limits": {
-            "min_alpha_open_cells": min_alpha(int(s.cell.iloc[dev].nunique())),
-            "min_alpha_three_zero_cells": min_alpha(3),
-            "worked_bounds": {"1200_of_1200_samples": cp_lower(1200, 1200), "24_of_24_cells": cp_lower(24, 24),
-                              "50_of_50_samples": cp_lower(50, 50), "1_of_1_cell": cp_lower(1, 1), "3_of_3_zero_materials": cp_lower(3, 3)},
-            "lots_needed": {str(t): units_needed(t) for t in (0.90, 0.95, 0.99)},
-        },
         "load_audit": load_audit,
         "radar": radar,
         "controls": ctrl,
-        "decision": decision,
+        "verdicts": verdicts,
         "reference": reference_summary,
         "rows": rows,
     }
