@@ -45,7 +45,10 @@ st.set_page_config(page_title="Earned Pass", page_icon="🧪", layout="wide")
 # ---------------------------------------------------------------- loading
 def _read(path):
     z = np.load(path)
-    probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i]) for i, ss in enumerate(z["sets"])}
+    wi = list(C.FOLDERS).index("D")
+    probs = {ss: decide.Probs(z["p1"][i], z["p3"][i], z["pl"][i],
+                              w3=z["t3"][i][:, wi] if "t3" in z else None, wl=z["tl"][i][:, wi] if "tl" in z else None)
+             for i, ss in enumerate(z["sets"])}
     types = {ss: (z["t3"][i], z["tl"][i]) for i, ss in enumerate(z["sets"])} if "t3" in z else None
     levels = {ss: (z["e3"][i], z["el"][i]) for i, ss in enumerate(z["sets"])} if "e3" in z else None
     is_ref = z["is_ref"] if "is_ref" in z else None
@@ -65,9 +68,10 @@ load = st.cache_resource(show_spinner="Loading artifacts...")(load)
 
 
 @st.cache_resource(show_spinner=False)
-def evaluate(_stamp, ref, mode, alpha, must_catch, bar, sensor_set):
+def evaluate(_stamp, ref, mode, alpha, must_catch, bar, sensor_set, wood_hold=None):
     d, _, art, _ = load(_stamp)
-    return decide.evaluate(d.samples, art[ref][0][sensor_set], decide.Settings(mode, alpha, must_catch, bar, sensor_set))
+    return decide.evaluate(d.samples, art[ref][0][sensor_set],
+                           decide.Settings(mode, alpha, must_catch, bar, sensor_set, wood_hold))
 
 
 if not (RESULTS.exists() and PROBS.exists()):
@@ -131,6 +135,16 @@ with st.sidebar:
                            format_func=SET_LABEL.get)
     note("A colorimeter and a camera are what an inspector has at the receiving dock. FTIR is a lab instrument.")
 
+    WOOD_ON = st.toggle("Hold any sample that may contain wood dust", True)
+    WOOD = None
+    if WOOD_ON:
+        WOOD = st.slider("Hold if the chance of wood dust is above", 1, 50, 5, 1, format="%d%%",
+                         help="Technical: HOLD when the filler model's probability of wood dust exceeds this, unless "
+                              "the screen has ruled out any filler.") / 100
+        note(f"Wood dust is never accepted. If filler can't be ruled out and the filler model gives wood more than "
+             f"{WOOD:.0%}, the sample gets **HOLD** whatever its amount. Slide left to be stricter. Peanut and walnut shell "
+             "are not affected by this rule.")
+
     USER = st.text_input("Your name", "inspector-1")
     note("Written into the decision log next to every decision you record.")
     st.divider()
@@ -139,8 +153,8 @@ with st.sidebar:
                else "locked cells (levels 3, 10, 18) not scored yet"))
 
 PROBS_BY_SET, TYPES, LEVEL_EST, IS_REF = ART[REF]
-RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, SENSORS)
-LAB_RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, C.LAB_SET)
+RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, SENSORS, WOOD)
+LAB_RES = evaluate(STAMP, REF, MODE, ALPHA, MUST, BAR, C.LAB_SET, WOOD)
 
 
 def pct(x, digits=1):
@@ -210,24 +224,23 @@ def filler_guess(cur, pool, row):
         st.caption("Filler type is not available yet. Run `python -m earnedpass.run_all` once to add it.")
         return
     t3, tl = TYPES[SENSORS]
-    p = (tl if pool == "locked" else t3)[cur]
     codes = list(C.FOLDERS)
-    top = int(np.argmax(p))
+    wood, nut, peanut, walnut = filler_split(cur, pool)
     blends = D.dev[(S.level.to_numpy()[D.dev] > 0) & np.isfinite(t3[D.dev]).all(1)]
-    hit = float((t3[blends].argmax(1) == S.code.iloc[blends].map(codes.index).to_numpy()).mean())
-    lead = "**If there is filler, most likely:**" if row.in_zero else "**Likely filler:**"
-    if row.candidate == "PASS":
-        st.markdown("**Likely filler:** none suspected")
-    elif p[top] < FILLER_SURE:
-        st.markdown("**Likely filler:** cannot tell which. " + ", ".join(f"{C.FOLDER_LABEL[c]} {pct(v, 0)}" for c, v in zip(codes, p)))
-    else:
-        nut = " Possible nut-shell material: confirm at the lab." if codes[top] in ("P", "W") else ""
-        st.markdown(f"{lead} {C.FOLDER_LABEL[codes[top]]} (model {pct(p[top], 0)}).{nut}")
+    is_wood = S.code.to_numpy()[blends] == "D"
+    called_wood = t3[blends][:, codes.index("D")] >= 0.5
+    group_hit = float((is_wood == called_wood).mean())
+    wood_missed = float((~called_wood[is_wood]).mean()) if is_wood.any() else float("nan")
+    st.markdown(f"**Likely filler:** {filler_short(cur, pool, row)}")
+    st.markdown(f"Filler model, all three: wood dust {pct(wood, 0)} · peanut shell {pct(peanut, 0)} · walnut shell "
+                f"{pct(walnut, 0)}" + (". Possible nut-shell material: confirm at the lab." if nut >= FILLER_SURE else "."))
+    st.markdown(f"**Wood dust rule:** {wood_text(row)}.")
     with st.popover("How far to trust the filler guess"):
         st.markdown(
             f"- The screen only knows three fillers: peanut shell, walnut shell and wood dust. It always picks among them, "
             "so a filler it has never seen would be given one of these names.\n"
-            f"- On blends it had not seen, these instruments named the right filler for **{pct(hit)}** of samples.\n"
+            f"- On blends it had not seen, these instruments told wood dust from nut shell correctly for **{pct(group_hit)}** "
+            f"of samples, and called wood blends nut shell **{pct(wood_missed)}** of the time.\n"
             "- In this dataset each filler was prepared and photographed in its own batch, on its own days. The guess may "
             "partly be recognising the batch, not the filler.\n"
             "- It has no answer for “no filler”. If the screen flags pure cinnamon by mistake, it will still name a filler "
@@ -285,14 +298,15 @@ def truth_checks(cur, pool, row, smp) -> dict:
     else:
         call = "✗ wrong: pure cinnamon held" if smp.level == 0 else "✓ right: it is adulterated"
     guess = filler_short(cur, pool, row)
-    if TYPES is None or guess == "cannot tell which":
+    if TYPES is None or guess.startswith("cannot tell"):
         filler = "no guess made"
     elif guess == "none suspected":
         filler = "✓ right" if smp.level == 0 else "✗ wrong: there is filler"
     elif smp.level == 0:
         filler = "there is no filler (the screen had not ruled that out)" if row.in_zero else "✗ wrong: there is no filler"
     else:
-        filler = "✓ right" if guess.startswith(C.FOLDER_LABEL[smp.code]) else "✗ wrong"
+        truth_name = C.FOLDER_LABEL[smp.code]
+        filler = "✓ right" if guess.startswith(truth_name) else f"✗ wrong: it is {truth_name.lower()}"
     out = {"Ground truth": truth, "Recommendation was": call, "Filler guess was": filler}
     le = level_estimate(cur, pool)
     if le is not None:
@@ -332,7 +346,8 @@ def page_inspect():
         st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d}")
     with right:
         lane_card(row.lane, "")
-        rows = {"Likely filler": filler_short(cur, pool, row), "Estimated filler amount": estimate_text(cur, pool)}
+        rows = {"Likely filler": filler_short(cur, pool, row), "Chance of wood dust": wood_text(row),
+                "Estimated filler amount": estimate_text(cur, pool)}
         if show_truth or revealed:
             rows.update(truth_checks(cur, pool, row, smp))
         else:
@@ -351,7 +366,7 @@ def page_inspect():
     label = "Record and release without a lab check" if decision == "PASS" else "Record and send to lab"
     if b.button(label, disabled=revealed):
         append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
-                        model_version=R["meta"]["model_version"], mode=MODE + ("+supplier_reference" if REF == "supplier" else ""),
+                        model_version=R["meta"]["model_version"], mode=MODE + ("+supplier_reference" if REF == "supplier" else "") + (f"+wood_hold>{WOOD:.0%}" if WOOD is not None else ""),
                         must_catch=MUST, alpha=ALPHA, pass_bar=BAR,
                         sensors=SENSORS, recommended=row.lane, decision=decision, override=decision != row.lane,
                         sent_to_lab=decision != "PASS", user=USER))
@@ -417,7 +432,7 @@ def page_inspect():
             "2. It gives one of three recommendations:\n"
             f"   - {LANE['PASS']['icon']} **PASS**: the sample looks like pure cinnamon *and* the screen has earned the right to say so. No lab check.\n"
             f"   - {LANE['LAB']['icon']} **LAB**: the screen is not sure. Send the sample for a routine lab check.\n"
-            f"   - {LANE['HOLD']['icon']} **HOLD**: the screen is confident the sample has at least {MUST}% filler. Keep the lot back and test it first.\n"
+            f"   - {LANE['HOLD']['icon']} **HOLD**: the screen is confident the sample has at least {MUST}% filler, or wood dust can't be ruled out. Keep the lot back and test it first.\n"
             "3. **Likely filler** and **Filler amount** are the screen's best reading of what was added and how much.\n"
             "4. **Ground truth** is what the dataset says the sample really is, with a check on each thing the screen said. "
             "Switch it off at the top to screen blind.\n"
@@ -756,17 +771,39 @@ def page_evidence():
 
 
 # ---------------------------------------------------------------- Compare
-def filler_short(cur, pool, row) -> str:
+def filler_split(cur, pool):
+    """(P(wood dust), P(nut shell), P(peanut), P(walnut)) from the filler model, or None."""
     if TYPES is None:
+        return None
+    t3, tl = TYPES[SENSORS]
+    p = (tl if pool == "locked" else t3)[cur]
+    codes = list(C.FOLDERS)
+    pp, pw, pd = p[codes.index("P")], p[codes.index("W")], p[codes.index("D")]
+    return float(pd), float(pp + pw), float(pp), float(pw)
+
+
+def filler_short(cur, pool, row) -> str:
+    sp = filler_split(cur, pool)
+    if sp is None:
         return "not available"
     if row.candidate == "PASS":
         return "none suspected"
-    t3, tl = TYPES[SENSORS]
-    p = (tl if pool == "locked" else t3)[cur]
-    top = int(np.argmax(p))
-    if p[top] < FILLER_SURE:
-        return "cannot tell which"
-    return f"{C.FOLDER_LABEL[list(C.FOLDERS)[top]]} (model {pct(p[top], 0)})" + (", if there is any" if row.in_zero else "")
+    wood, _, peanut, walnut = sp
+    chances = {C.FOLDER_LABEL["P"]: peanut, C.FOLDER_LABEL["W"]: walnut, C.FOLDER_LABEL["D"]: wood}
+    name, top = max(chances.items(), key=lambda kv: kv[1])
+    if top < FILLER_SURE:
+        return "cannot tell which: " + ", ".join(f"{k.lower()} {pct(v, 0)}" for k, v in chances.items())
+    return f"{name} (model {pct(top, 0)})" + (", if there is any" if row.in_zero else "")
+
+
+def wood_text(row) -> str:
+    if WOOD is None:
+        return "rule switched off"
+    if row.p_wood != row.p_wood:
+        return "not available"
+    if row.candidate == "PASS":
+        return f"{pct(row.p_wood, 0)}, not applied: no filler suspected"
+    return f"{pct(row.p_wood, 0)}, {'✗ above' if row.wood_hold else '✓ below'} the {WOOD:.0%} hold limit"
 
 
 def reference_name(smp) -> str:
@@ -881,7 +918,7 @@ def _fmt(key, v):
 
 def mode_numbers(ref, pool="dev"):
     """Headline, baseline and model numbers for one reference mode, current settings."""
-    res = evaluate(STAMP, ref, MODE, ALPHA, MUST, BAR, SENSORS)
+    res = evaluate(STAMP, ref, MODE, ALPHA, MUST, BAR, SENSORS, WOOD)
     df = res.df[res.df.pool == pool]
     _, types, levels, _ = ART[ref]
     rows = df.row.to_numpy()
@@ -907,6 +944,7 @@ def page_scoreboard():
     st.subheader("1 · At a glance")
     cards = [
         ("wrong_pass", "Released without a lab check although adulterated. The most serious error.", cur["wrong_pass"] == 0, "target 0%"),
+        ("wood_not_held", "Wood dust blends that did not get HOLD. Wood is never accepted.", cur["wood_not_held"] == 0, "target 0%"),
         ("pure_held", "Pure cinnamon held back: a delay and a lab fee for nothing.", cur["pure_held"] <= 0.05, "target ≤ 5%"),
         ("decided", "Samples the screen settled itself. The rest go to the lab, so higher means more lab work saved.", None, "higher is better"),
         ("decided_right", "Of the PASS and HOLD calls it made, how many were correct.", cur["decided_right"] >= 0.95, "target ≥ 95%"),
@@ -916,7 +954,7 @@ def page_scoreboard():
     cols = st.columns(len(cards))
     for col, (key, text, ok, target) in zip(cols, cards):
         mark = "" if ok is None else ("✓ " if ok else "✗ ")
-        short = {"wrong_pass": "Adulterated passed", "pure_held": "Pure held", "decided": "Decided",
+        short = {"wrong_pass": "Adulterated passed", "wood_not_held": "Wood not held", "pure_held": "Pure held", "decided": "Decided",
                  "decided_right": "Right decisions", "range_has_truth": "Range has truth"}[key]
         col.metric(short, _fmt(key, cur[key]), help=scoreboard.LABEL[key])
         col.caption(f"{mark}{target}. {text}")

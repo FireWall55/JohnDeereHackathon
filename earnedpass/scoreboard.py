@@ -12,9 +12,10 @@ import pandas as pd
 
 from . import config as C
 
-HEADLINE = ["wrong_pass", "pure_held", "decided", "decided_right", "range_has_truth"]
+HEADLINE = ["wrong_pass", "wood_not_held", "pure_held", "decided", "decided_right", "range_has_truth"]
 LABEL = {
     "wrong_pass": "Adulterated samples passed",
+    "wood_not_held": "Wood dust samples not held",
     "pure_held": "Pure samples held",
     "decided": "Samples decided (PASS or HOLD)",
     "decided_right": "Decisions that were right",
@@ -38,6 +39,8 @@ def from_lanes(df: pd.DataFrame, lane_col="lane") -> dict:
     right = ((lane == "PASS") & pure) | ((lane == "HOLD") & blend)
     return {
         "wrong_pass": _rate(((lane == "PASS") & blend).sum(), blend.sum()),
+        "wood_not_held": _rate(((lane != "HOLD") & blend & (df.code.to_numpy() == "D")).sum(),
+                               (blend & (df.code.to_numpy() == "D")).sum()) if "code" in df else float("nan"),
         "pure_held": _rate(((lane == "HOLD") & pure).sum(), pure.sum()),
         "decided": _rate(decided.sum(), len(df)),
         "decided_right": _rate((right & decided).sum(), decided.sum()),
