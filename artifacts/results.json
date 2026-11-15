@@ -1,8 +1,8 @@
 {
  "meta": {
-  "created": "2026-11-15T10:03:30",
-  "git_sha": "437f7c6",
-  "model_version": "437f7c6-20261115T100330",
+  "created": "2026-11-15T10:48:54",
+  "git_sha": "4859c42",
+  "model_version": "4859c42-20261115T104854",
   "locked_scored_at": null,
   "locked_levels": [
    3,
@@ -1210,7 +1210,7 @@
      "walnut_labelled": 1.0,
      "wrong_nut_label": 0.0,
      "pure_to_verify": 0.8846153846153846,
-     "pure_rejected": 0.0,
+     "pure_rejected": 0.038461538461538464,
      "right": 0.9936974789915967,
      "n": 1428,
      "materials": 30
@@ -1237,8 +1237,8 @@
      "pure": {
       "LABEL": 0,
       "LAB_PURE": 69,
-      "LAB_WOOD": 9,
-      "REJECT": 0
+      "LAB_WOOD": 6,
+      "REJECT": 3
      }
     }
    },
@@ -1413,13 +1413,13 @@
     "counts": {
      "Peanut shell": {
       "LABEL": 328,
-      "LAB_WOOD": 120,
-      "REJECT": 2
+      "LAB_WOOD": 43,
+      "REJECT": 79
      },
      "Walnut shell": {
       "LABEL": 314,
-      "LAB_WOOD": 136,
-      "REJECT": 0
+      "LAB_WOOD": 35,
+      "REJECT": 101
      },
      "Wood dust": {
       "LABEL": 0,
@@ -1436,7 +1436,7 @@
    "ftir": {
     "summary": {
      "wood_let_through": 0.0,
-     "wood_rejected": 0.8955555555555555,
+     "wood_rejected": 1.0,
      "filler_missed": 0.0,
      "peanut_labelled": 1.0,
      "walnut_labelled": 0.9977777777777778,
@@ -1460,8 +1460,8 @@
      },
      "Wood dust": {
       "LABEL": 0,
-      "LAB_WOOD": 47,
-      "REJECT": 403
+      "LAB_WOOD": 0,
+      "REJECT": 450
      },
      "pure": {
       "LABEL": 100,
@@ -1488,14 +1488,14 @@
      "Peanut shell": {
       "LABEL": 319,
       "LAB_PURE": 0,
-      "LAB_WOOD": 57,
-      "REJECT": 74
+      "LAB_WOOD": 14,
+      "REJECT": 117
      },
      "Walnut shell": {
       "LABEL": 424,
       "LAB_PURE": 0,
-      "LAB_WOOD": 18,
-      "REJECT": 8
+      "LAB_WOOD": 10,
+      "REJECT": 16
      },
      "Wood dust": {
       "LABEL": 0,
@@ -1565,8 +1565,8 @@
     "counts": {
      "Peanut shell": {
       "LABEL": 353,
-      "LAB_WOOD": 92,
-      "REJECT": 5
+      "LAB_WOOD": 36,
+      "REJECT": 61
      },
      "Walnut shell": {
       "LABEL": 426,
@@ -1594,7 +1594,7 @@
      "walnut_labelled": 1.0,
      "wrong_nut_label": 0.0,
      "pure_to_verify": 0.3333333333333333,
-     "pure_rejected": 0.5933333333333334,
+     "pure_rejected": 0.6666666666666666,
      "right": 0.932,
      "n": 1500,
      "materials": 30
@@ -1603,8 +1603,8 @@
      "Peanut shell": {
       "LABEL": 448,
       "LAB_PURE": 0,
-      "LAB_WOOD": 2,
-      "REJECT": 0
+      "LAB_WOOD": 1,
+      "REJECT": 1
      },
      "Walnut shell": {
       "LABEL": 450,
@@ -1621,8 +1621,8 @@
      "pure": {
       "LABEL": 0,
       "LAB_PURE": 50,
-      "LAB_WOOD": 11,
-      "REJECT": 89
+      "LAB_WOOD": 0,
+      "REJECT": 100
      }
     }
    },
@@ -1666,7 +1666,7 @@
   },
   "limits": {
    "wood_lab": 0.01,
-   "wood_reject": 0.1,
+   "wood_reject": 0.02,
    "peanut": 0.1,
    "walnut": 0.1
   }

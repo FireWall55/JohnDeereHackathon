@@ -23,8 +23,9 @@ import streamlit.components.v1 as components
 
 from earnedpass import config as C
 from earnedpass import data as data_mod
-from earnedpass import models
+from earnedpass import deploy, models
 from earnedpass import verdict as V
+from earnedpass.load import parse_id
 from earnedpass.eval.ladder import HEADLINE
 from earnedpass.run_all import PROBS, PROBS_REF, RESULTS
 
@@ -193,6 +194,10 @@ CSS = f"""
   .ep-kpis {{ grid-template-columns:repeat(2,1fr); }}
 }}
 """
+CSS += """
+.ep-limits { font-size: .88rem; line-height: 1.6; padding: .55rem .75rem; border-radius: .55rem;
+             border: 1px solid var(--ep-border, rgba(128,128,128,.35)); }
+"""
 st.html(f"<style>{CSS}</style>")
 
 
@@ -240,15 +245,19 @@ def verdicts(_stamp, ref, sensors, th: V.Thresholds) -> pd.DataFrame:
     return V.screened(d.samples, a["band"], a["types"], th)
 
 
-if not (RESULTS.exists() and PROBS.exists() and PROBS_REF.exists()):
-    st.error("No results yet. Build them first:")
-    st.code("python -m earnedpass.run_all", language="bash")
-    st.stop()
-
-STAMP = RESULTS.stat().st_mtime
-D, R, ART, IS_REF, SPECTRA = load(STAMP)
-S = D.samples
-SCORED = bool(R["meta"]["locked_scored_at"])
+# The dataset pages need the dataset and the cached pipeline outputs. Without them (an outside user who only
+# has the repo), the app still runs: Screen a sample uses the saved model in models/screen_model.pkl.
+DATA_FILES = [RESULTS, PROBS, PROBS_REF, C.ARTIFACTS / "samples.parquet", C.ARTIFACTS / "X_img.npy",
+              C.ARTIFACTS / "X_ftir.npy", C.THUMBS]
+DATA_OK = all(f.exists() for f in DATA_FILES)
+STAMP = RESULTS.stat().st_mtime if RESULTS.exists() else 0.0
+if DATA_OK:
+    D, R, ART, IS_REF, SPECTRA = load(STAMP)
+    S = D.samples
+else:
+    D = S = ART = IS_REF = SPECTRA = None
+    R = json.loads(RESULTS.read_text()) if RESULTS.exists() else None
+SCORED = bool(R and R["meta"]["locked_scored_at"])
 POOL = "locked" if SCORED else "dev"
 
 with st.sidebar:
@@ -268,16 +277,30 @@ with st.sidebar:
     note("A colorimeter and a camera are what an inspector has at the receiving dock. FTIR is a lab instrument.")
 
     st.subheader("Verdict limits")
-    note("Each limit is compared with the **chance that filler is present**: the chance of any filler × the chance "
-         "it is that filler. Lower a limit to be stricter.")
-    WOOD_LAB = st.slider("Wood dust: send to lab above", 1, 20, 1, 1, format="%d%%")
-    note("Any sign of wood dust goes to the lab before the lot is used.")
-    WOOD_REJECT = st.slider("Wood dust: reject above", WOOD_LAB, 50, max(10, WOOD_LAB), 1, format="%d%%")
-    note("Above this the lot is rejected and discarded. Wood is never accepted.")
-    PEANUT = st.slider("Peanut shell: label above", 1, 50, 10, 1, format="%d%%")
-    WALNUT = st.slider("Walnut shell: label above", 1, 50, 10, 1, format="%d%%")
-    note("Above these the lot is labelled as containing that nut shell. Both can be labelled at once; the screen "
-         "does not choose between them. Below every limit, the lot goes to the lab to verify it is pure.")
+    # The limits are the QC manager's decision, not the inspector's: adjustable only in developer view
+    # (the switch at the bottom of the sidebar). Everyone else screens with the team's defaults.
+    DEFAULT_TH = V.Thresholds()
+    if st.session_state.get("dev_view", False):
+        note("Each limit is compared with the **chance that filler is present**: the chance of any filler × the "
+             "chance it is that filler. Lower a limit to be stricter.")
+        WOOD_LAB = st.slider("Wood dust: send to lab above", 1, 20, round(DEFAULT_TH.wood_lab * 100), 1, format="%d%%")
+        note("Any sign of wood dust goes to the lab before the lot is used.")
+        WOOD_REJECT = st.slider("Wood dust: reject above", WOOD_LAB, 50, max(round(DEFAULT_TH.wood_reject * 100), WOOD_LAB),
+                                1, format="%d%%")
+        note("Above this the lot is rejected and discarded. Wood is never accepted.")
+        PEANUT = st.slider("Peanut shell: label above", 1, 50, round(DEFAULT_TH.peanut * 100), 1, format="%d%%")
+        WALNUT = st.slider("Walnut shell: label above", 1, 50, round(DEFAULT_TH.walnut * 100), 1, format="%d%%")
+        note("Above these the lot is labelled as containing that nut shell. Both can be labelled at once; the "
+             "screen does not choose between them. Below every limit, the lot goes to the lab to verify it is pure.")
+    else:
+        WOOD_LAB, WOOD_REJECT = round(DEFAULT_TH.wood_lab * 100), round(DEFAULT_TH.wood_reject * 100)
+        PEANUT, WALNUT = round(DEFAULT_TH.peanut * 100), round(DEFAULT_TH.walnut * 100)
+        st.html(f'<div class="ep-limits">'
+                f'<div>Wood dust: lab above <b>{WOOD_LAB}%</b>, reject above <b>{WOOD_REJECT}%</b></div>'
+                f'<div>Peanut shell: label above <b>{PEANUT}%</b></div>'
+                f'<div>Walnut shell: label above <b>{WALNUT}%</b></div></div>')
+        note("Set by the QC manager. Each limit is compared with the chance that filler is present. Below every "
+             "limit, the lot goes to the lab to verify it is pure.")
 
     USER = st.text_input("Your name", "inspector-1")
     note("Written into the decision log next to every decision you record.")
@@ -290,11 +313,12 @@ with st.sidebar:
     if DEV:
         st.caption("Developer view is on. The pure samples tested come from the same batch as the reference, so "
                    "results on pure cinnamon are optimistic.")
-        st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"]
-                   if SCORED else "locked cells (levels 3, 10, 18) not scored yet"))
+        if R:
+            st.caption(f"Model {R['meta']['model_version']} · " + ("locked cells scored " + R["meta"]["locked_scored_at"]
+                       if SCORED else "locked cells (levels 3, 10, 18) not scored yet"))
 
 TH = V.Thresholds(WOOD_LAB / 100, WOOD_REJECT / 100, PEANUT / 100, WALNUT / 100)
-VERD = verdicts(STAMP, "supplier", SENSORS, TH)
+VERD = verdicts(STAMP, "supplier", SENSORS, TH) if DATA_OK else None
 
 
 # ---------------------------------------------------------------- helpers
@@ -732,7 +756,9 @@ def how_far_to_trust():
 
 # ---------------------------------------------------------------- Inspect
 def page_inspect():
-    st.title("Sample screening")
+    st.title("Demo: dataset samples")
+    st.caption("Samples from the hackathon dataset, each judged by models that never saw that material. To screen your "
+               "own sample, use **Screen a sample**.")
     df = VERD[VERD.pool == POOL].set_index("row")
     pick = st.session_state.get("demo_pick", "Any material")
     ss = st.session_state
@@ -854,6 +880,270 @@ def demo_controls(df):
                      help="For rehearsing the demo. An inspector would not know this.")
 
 
+# ---------------------------------------------------------------- Screen a sample (uploads)
+@st.cache_resource(show_spinner=False)
+def screen_model(_mtime):
+    return deploy.load_model()
+
+
+def all_references(model) -> dict:
+    """Built-in example suppliers from the dataset, then the user's own."""
+    refs = {r.name: r for r in model.examples.values()}
+    refs.update(deploy.load_suppliers())
+    return refs
+
+
+def upload_row(out, i=0) -> pd.Series:
+    p_any, pres = V.chances(out["p_band"][i:i + 1], out["p_type"][i:i + 1])
+    lane, lp, lw = V.rules(pres, TH)
+    return pd.Series(dict(p_any=float(p_any[0]), p_peanut=float(pres[0, V.P]), p_walnut=float(pres[0, V.W]),
+                          p_wood=float(pres[0, V.D]), lane=lane[0], label_peanut=bool(lp[0]),
+                          label_walnut=bool(lw[0]), outside=bool(out["outside"][i]),
+                          distance=float(out["distance"][i]), level=float(out["level"][i])))
+
+
+def outside_html() -> str:
+    return ('<div class="ep-verdict" style="--c:#6b6862;--fg:#ffffff"><div class="ep-eyebrow">1 · The verdict</div>'
+            '<div class="ep-verdict-title"><span class="ep-glyph">?</span>LAB</div>'
+            '<div class="ep-verdict-text">Outside what the screen was trained on. Send to the lab.</div></div>')
+
+
+def upload_rows(row, ref_name, model) -> tuple:
+    rows, colours = chance_rows(row), {}
+    colours["Chance of peanut shell"] = chance_colour(row.p_peanut, [(PEANUT, "blue")])
+    colours["Chance of walnut shell"] = chance_colour(row.p_walnut, [(WALNUT, "blue")])
+    colours["Chance of wood dust"] = chance_colour(row.p_wood, [(WOOD_LAB, "orange"), (WOOD_REJECT, "red")])
+    m = model.margin
+    rows["Estimated filler amount"] = f"about {row.level:.0f}%  (likely {max(0, row.level - m):.0f}–{min(24, row.level + m):.0f}%)"
+    rows["Compared with"] = ref_name
+    rows["Like the training data?"] = ("✗ no: outside the range the screen was trained on" if row.outside
+                                       else "✓ yes: within the range the screen was trained on")
+    colours["Like the training data?"] = "red" if row.outside else "green"
+    return rows, colours
+
+
+def register_supplier(model):
+    st.markdown("**Register a supplier's reference.** Use the supplier's pure cinnamon, confirmed pure by a lab. "
+                "Upload several photos and enter several colorimeter readings of it: the screen averages them, so "
+                "more of each gives a steadier reference.")
+    with st.form("register", clear_on_submit=False):
+        name = st.text_input("Supplier name", placeholder="e.g. Kerala Spice Co., Ceylon lot 2026-11")
+        photos = st.file_uploader("Photos of the pure reference powder (one or more)", type=["jpg", "jpeg", "png"],
+                                  accept_multiple_files=True)
+        readings = st.data_editor(pd.DataFrame({"L*": [None] * 3, "a*": [None] * 3, "b*": [None] * 3}, dtype=float),
+                                  num_rows="dynamic", width="stretch", key="ref_readings")
+        go_ = st.form_submit_button("Register supplier", type="primary")
+    if not go_:
+        return
+    name = name.strip()
+    lab = readings.dropna().to_numpy(float)
+    problems = []
+    if not name:
+        problems.append("Give the supplier a name.")
+    elif name in all_references(model):
+        problems.append(f"A supplier called “{name}” already exists. Delete it first or pick another name.")
+    if not photos:
+        problems.append("Upload at least one photo.")
+    if not len(lab):
+        problems.append("Enter at least one complete colour reading (L*, a* and b*).")
+    feats, previews = [], []
+    for f in photos or []:
+        try:
+            x, prev = deploy.photo_features(f.getvalue())
+            feats.append(x)
+            previews.append((f.name, prev))
+        except ValueError as e:
+            problems.append(f"{f.name}: {e}")
+    if problems:
+        for msg in problems:
+            st.error(msg)
+        return
+    feats = np.vstack(feats)
+    ref = deploy.Reference(name=name, lab=lab.mean(0).tolist(), img=feats.mean(0).tolist(),
+                           n_photos=len(feats), n_readings=len(lab))
+    refs = deploy.load_suppliers()
+    refs[name] = ref
+    deploy.save_suppliers(refs)
+    st.success(f"Registered “{name}” from {len(feats)} photo(s) and {len(lab)} reading(s).")
+    # Consistency: does any photo or reading stand out from the others?
+    photo_lab = feats[:, :3]
+    d_photo = np.linalg.norm(photo_lab - photo_lab.mean(0), axis=1)
+    d_read = np.linalg.norm(lab - lab.mean(0), axis=1)
+    if len(feats) > 1 and d_photo.max() > 3:
+        st.warning(f"One photo differs from the others by ΔE {d_photo.max():.1f} "
+                   f"({previews[int(d_photo.argmax())][0]}). Check it is the same powder and lighting.")
+    if len(lab) > 1 and d_read.max() > 2:
+        st.warning(f"One colour reading differs from the others by ΔE {d_read.max():.1f}. Check it was taken correctly.")
+    cols = st.columns(min(4, len(previews)))
+    for i, (fname, prev) in enumerate(previews):
+        cols[i % len(cols)].image(prev, caption=f"{fname} · measured inside the red circle")
+
+
+def suppliers_tab(model):
+    refs = all_references(model)
+    st.dataframe(pd.DataFrame([{"Supplier": r.name, "Photos": r.n_photos, "Colour readings": r.n_readings,
+                                "L*a*b* (average)": " / ".join(f"{v:.1f}" for v in r.lab),
+                                "Added": "built in (dataset)" if r.example else r.created.replace("T", " ")}
+                               for r in refs.values()]), hide_index=True, width="stretch")
+    st.caption("The three built-in examples are the pure batches from the hackathon dataset, so you can try the screen "
+               "straight away. Register your own supplier below.")
+    register_supplier(model)
+    own = deploy.load_suppliers()
+    if own:
+        with st.expander("Remove a supplier"):
+            gone = st.selectbox("Supplier", list(own))
+            if st.button("Remove", type="secondary"):
+                own.pop(gone, None)
+                deploy.save_suppliers(own)
+                st.rerun()
+
+
+def one_sample_tab(model):
+    refs = all_references(model)
+    ss = st.session_state
+    with st.form("screen_one"):
+        a, b = st.columns([1.2, 1])
+        ref_name = a.selectbox("Supplier", list(refs), help="The sample is compared with this supplier's reference.")
+        sample = b.text_input("Sample or lot name", placeholder="e.g. lot 4471, bag 3")
+        photo = st.file_uploader("Photo of the sample powder in a dish", type=["jpg", "jpeg", "png"])
+        c1, c2, c3 = st.columns(3)
+        L = c1.number_input("L* (lightness)", value=None, step=0.01, format="%.2f")
+        a_ = c2.number_input("a* (green to red)", value=None, step=0.01, format="%.2f")
+        b_ = c3.number_input("b* (blue to yellow)", value=None, step=0.01, format="%.2f")
+        go_ = st.form_submit_button("Screen this sample", type="primary")
+    if go_:
+        problems = [m for m, bad in (("Upload a photo.", photo is None),
+                                     ("Enter all three colour readings.", None in (L, a_, b_))) if bad]
+        if not problems:
+            try:
+                img, prev = deploy.photo_features(photo.getvalue())
+            except ValueError as e:
+                problems.append(str(e))
+        if problems:
+            for msg in problems:
+                st.error(msg)
+            return
+        out = model.predict([[L, a_, b_]], img, refs[ref_name])
+        ss.upload_result = dict(row=upload_row(out), ref=ref_name, preview=prev,
+                                sample=sample.strip() or photo.name, recorded=None)
+    res = ss.get("upload_result")
+    if not res:
+        return
+    row = res["row"]
+    st.divider()
+    st.html(outside_html() if row.outside else verdict_html(row, eyebrow="1 · The verdict"))
+    left, right = st.columns([1, 1.5], gap="large")
+    with left:
+        st.image(res["preview"], caption=f"{res['sample']} · measured inside the red circle")
+    with right:
+        step("2 · Why", "The chance of each filler, against the limits in the sidebar")
+        filler_meters(row)
+        sample_table({"This sample": upload_rows(row, res["ref"], model)})
+    if row.outside:
+        st.warning("This sample is further from the training data than 99.9% of the samples the screen learned from. "
+                   "Common causes: a different camera, lighting or dish; a compressed or edited photo; a reading from "
+                   "a differently set-up colorimeter; or a filler the screen has never seen. The verdict above the "
+                   "line would not be reliable, so it goes to the lab.")
+    with st.container(border=True):
+        recommended = "OUTSIDE" if row.outside else row.lane
+        default = V.LAB_PURE if row.outside else row.lane
+        decision = st.radio("Your decision", V.LANES, index=V.LANES.index(res["recorded"] or default),
+                            format_func=LANE_CHOICE.get, horizontal=True, disabled=res["recorded"] is not None,
+                            key=f"upload_decision_{res['sample']}")
+        if st.button("Record decision", disabled=res["recorded"] is not None):
+            append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=res["sample"],
+                            model_version=f"screen-model {model.info['created']}", sensors="colour+image",
+                            wood_lab=WOOD_LAB, wood_reject=WOOD_REJECT, peanut_limit=PEANUT, walnut_limit=WALNUT,
+                            recommended=recommended, labels=label_text(row), decision=decision,
+                            override=decision != default, sent_to_lab=decision in (V.LAB_WOOD, V.LAB_PURE), user=USER))
+            res["recorded"] = decision
+            st.rerun()
+        if res["recorded"]:
+            st.success(f"Recorded: {LANE_CHOICE[res['recorded']]}.")
+
+
+BATCH_COLUMNS = ["sample", "supplier", "L", "a", "b", "photo"]
+
+
+def batch_tab(model):
+    refs = all_references(model)
+    st.markdown("Screen many samples at once. Upload a table with one row per sample and the photos it names.")
+    example = pd.DataFrame([{"sample": "lot 4471 bag 1", "supplier": next(iter(refs)), "L": 52.4, "a": 12.1, "b": 19.6,
+                             "photo": "lot4471_bag1.jpg"}], columns=BATCH_COLUMNS)
+    st.download_button("Download a template (CSV)", example.to_csv(index=False).encode(), "screening_template.csv",
+                       "text/csv")
+    st.caption("Columns: sample (any name), supplier (exactly as in the Suppliers tab), L, a, b (the colorimeter "
+               "reading), photo (the file name of that sample's photo).")
+    table = st.file_uploader("The table (CSV)", type=["csv"], key="batch_csv")
+    photos = st.file_uploader("The photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="batch_photos")
+    if not st.button("Screen all", type="primary", disabled=table is None):
+        return
+    try:
+        df = pd.read_csv(table)
+    except Exception as e:
+        st.error(f"The table could not be read: {e}")
+        return
+    missing = [c for c in BATCH_COLUMNS if c not in df.columns]
+    if missing:
+        st.error(f"The table is missing these columns: {', '.join(missing)}.")
+        return
+    files = {f.name: f for f in photos or []}
+    out_rows = []
+    progress = st.progress(0.0)
+    for k, r in enumerate(df.itertuples(index=False)):
+        rec = {"sample": r.sample, "supplier": r.supplier}
+        try:
+            if r.supplier not in refs:
+                raise ValueError(f"unknown supplier “{r.supplier}”")
+            if r.photo not in files:
+                raise ValueError(f"photo “{r.photo}” was not uploaded")
+            lab = [float(r.L), float(r.a), float(r.b)]
+            if not np.isfinite(lab).all():
+                raise ValueError("colour reading incomplete")
+            img, _ = deploy.photo_features(files[r.photo].getvalue())
+            row = upload_row(model.predict([lab], img, refs[r.supplier]))
+            rec.update({"verdict": "LAB (outside training range)" if row.outside else LANE_CHOICE[row.lane],
+                        "label": "" if row.outside else label_text(row),
+                        "chance peanut shell": round(row.p_peanut, 3), "chance walnut shell": round(row.p_walnut, 3),
+                        "chance wood dust": round(row.p_wood, 3), "estimated filler %": round(row.level, 1),
+                        "like the training data": not row.outside, "problem": ""})
+        except ValueError as e:
+            rec.update({"verdict": "not screened", "problem": str(e)})
+        out_rows.append(rec)
+        progress.progress((k + 1) / len(df))
+    res = pd.DataFrame(out_rows)
+    st.dataframe(res, hide_index=True, width="stretch")
+    st.download_button("Download the results (CSV)", res.to_csv(index=False).encode(), "screening_results.csv", "text/csv")
+
+
+def page_screen():
+    st.title("Screen a sample")
+    plain("Upload a photo of the powder and its colorimeter reading. The screen compares them with the supplier's "
+          "reference sample, estimates the chance of each filler, and gives one verdict. It supplements lab testing; "
+          "it does not replace it.")
+    st.warning("Before you rely on it: the screen was trained on lab-prepared blends of three fillers (peanut shell, "
+               "walnut shell, wood dust) at 0–24%, photographed with one camera setup. It is not validated on phone "
+               "photos or other fillers. Samples that look unlike its training data are sent to the lab.")
+    model = screen_model(deploy.MODEL_PATH.stat().st_mtime if deploy.MODEL_PATH.exists() else 0)
+    if model is None:
+        st.error("The screening model is missing. Build it with the dataset in place:")
+        st.code(".venv/bin/python -m earnedpass.deploy", language="bash")
+        return
+    st.caption("Uses the colorimeter and photo (the instruments setting in the sidebar applies to Demo samples only). "
+               "Verdict limits come from the sidebar.")
+    t1, t2, t3 = st.tabs(["Screen one sample", "Screen a batch", "Suppliers"])
+    with t1:
+        one_sample_tab(model)
+    with t2:
+        batch_tab(model)
+    with t3:
+        suppliers_tab(model)
+    if DEV:
+        st.caption(f"Developer view · screening model built {model.info['created']} on "
+                   f"{model.info['trained_on_samples']} samples from {model.info['trained_on_materials']} materials · "
+                   f"outside-range limit {model.limit:.2f} · amount margin ±{model.margin:.1f} points.")
+
+
 # ---------------------------------------------------------------- How it works
 WORKFLOW_DOT = """
 digraph {
@@ -966,10 +1256,14 @@ def page_how():
         "7. **Lab results go on file.** Confirmed lots build each supplier's track record.")
 
     st.subheader("2 · Why every sample is compared with its supplier's reference")
-    before_after_chart()
+    if DATA_OK:
+        before_after_chart()
+    else:
+        st.caption("The before-and-after colour chart needs the dataset. Run `python -m earnedpass.run_all` with the "
+                   "dataset in place to see it.")
 
     st.subheader("3 · New suppliers and new kinds of cinnamon")
-    ns = R["reference"]["new_supplier"]
+    ns = R["reference"]["new_supplier"] if R else None
     st.markdown(
         "Cinnamon differs by origin, species and batch, so the screen doesn't carry one fixed idea of “pure”. "
         "It carries the supplier's own reference. Bringing on a new supplier, or a new kind of cinnamon, works like this:\n\n"
@@ -980,7 +1274,7 @@ def page_how():
         "4. **Check early lots at the lab too.** Each confirmed lot adds to the supplier's track record.\n"
         "5. **A different kind of cinnamon** (for example cassia instead of Ceylon) gets its own reference, "
         "even from the same supplier.")
-    if DEV:
+    if DEV and ns:
         new_supplier_table(ns)
     st.warning(
         "**What this does not prove yet.**\n"
@@ -1247,7 +1541,7 @@ def page_log():
     st.title("Decision log")
     st.caption("One row per recorded decision. The inspector answers for the record; the tool only recommends.")
     if not LOG.exists():
-        st.info("No decisions recorded yet. Record one on the Inspect page.")
+        st.info("No decisions recorded yet. Record one on the Screen a sample or Demo samples page.")
         return
     log = pd.read_csv(LOG)
     a, b, c = st.columns(3)
@@ -1255,7 +1549,8 @@ def page_log():
     b.metric("Overrides", int(log.override.sum()))
     c.metric("Sent to lab", int(log.sent_to_lab.sum()))
     if DEV:
-        log.insert(2, "material (developer view)", log.sample_id.map(cell_name))
+        log.insert(2, "material (developer view)",
+                   log.sample_id.map(lambda x: cell_name(x) if parse_id(str(x)) else "uploaded sample"))
     st.dataframe(log.iloc[::-1], hide_index=True, width="stretch")
     st.download_button("Download CSV", LOG.read_bytes(), "earned_pass_decision_log.csv", "text/csv")
 
@@ -1263,7 +1558,7 @@ def page_log():
 # ---------------------------------------------------------------- Dark mode
 # Streamlit keeps the chosen theme in the browser's localStorage, one key per page path, and
 # applies it on load. The toggle writes that key and reloads the page. New visitors get light.
-THEME_PATHS = ["/", "/inspect", "/how-it-works", "/compare", "/scoreboard", "/evidence", "/log"]
+THEME_PATHS = ["/", "/screen", "/inspect", "/how-it-works", "/compare", "/scoreboard", "/evidence", "/log"]
 
 
 def theme_script(mode: str | None) -> str:
@@ -1297,9 +1592,11 @@ def theme_toggle():
 
 theme_toggle()
 
-PAGES = [st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
-         st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works")]
-if DEV:  # evaluation pages: for the team and the judges
+PAGES = [st.Page(page_screen, title="Screen a sample", icon=":material/upload:", url_path="screen", default=True)]
+if DATA_OK:
+    PAGES.append(st.Page(page_inspect, title="Demo samples", icon=":material/search:", url_path="inspect"))
+PAGES.append(st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works"))
+if DEV and DATA_OK:  # evaluation pages: for the team and the judges
     PAGES += [st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
               st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
               st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence")]

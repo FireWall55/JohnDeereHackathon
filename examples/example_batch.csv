@@ -1,0 +1,9 @@
+sample,supplier,L,a,b,photo,what it really is
+example CP0S49,Example: peanut shell supplier (dataset),65.48,5.79,21.51,CP0S49.png,pure cinnamon
+example CP2S32,Example: peanut shell supplier (dataset),51.55,12.37,20.34,CP2S32.png,"Peanut shell, 2%"
+example CP15S35,Example: peanut shell supplier (dataset),52.22,12.17,19.57,CP15S35.png,"Peanut shell, 15%"
+example CW0S43,Example: walnut shell supplier (dataset),51.58,12.48,19.64,CW0S43.png,pure cinnamon
+example CW6S29,Example: walnut shell supplier (dataset),52.8,12.23,20.14,CW6S29.png,"Walnut shell, 6%"
+example CD0S41,Example: wood dust supplier (dataset),54.47,7.73,13.54,CD0S41.png,pure cinnamon
+example CD1S42,Example: wood dust supplier (dataset),51.78,11.6,18.94,CD1S42.png,"Wood dust, 1%"
+example CD21S12,Example: wood dust supplier (dataset),52.51,11.09,18.96,CD21S12.png,"Wood dust, 21%"

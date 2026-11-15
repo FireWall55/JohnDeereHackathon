@@ -15,8 +15,9 @@ def lane(peanut, walnut, wood, th=V.Thresholds()):
 
 def test_team_rules():
     assert lane(0.0, 0.0, 0.50) == (V.REJECT, False, False)
-    assert lane(0.0, 0.0, 0.10)[0] == V.LAB_WOOD  # 10% is not above the reject limit
-    assert lane(0.0, 0.0, 0.05)[0] == V.LAB_WOOD
+    assert lane(0.0, 0.0, 0.10)[0] == V.REJECT
+    assert lane(0.0, 0.0, 0.02)[0] == V.LAB_WOOD  # 2% is not above the reject limit
+    assert lane(0.0, 0.0, 0.015)[0] == V.LAB_WOOD
     assert lane(0.0, 0.0, 0.01)[0] == V.LAB_PURE  # 1% is not above the lab limit
     assert lane(0.40, 0.0, 0.0) == (V.LABEL, True, False)
     assert lane(0.0, 0.40, 0.0) == (V.LABEL, False, True)
