@@ -365,9 +365,29 @@ def verdict_check(row, smp) -> str:
             "wrong": "✗ wrong: wrong nut labelled"}[row.result]
 
 
-def sample_table(row, smp, cur, show_truth) -> pd.DataFrame:
-    rows = chance_rows(row)
-    rows["Chance of any filler"] = pct(row.p_any, 0)
+TINT = {"green": "rgba(12,163,12,.22)", "red": "rgba(208,59,59,.28)", "orange": "rgba(236,131,90,.30)",
+        "blue": "rgba(42,120,214,.26)", "yellow": "rgba(250,178,25,.28)"}
+
+
+def chance_colour(p, limits):
+    """limits: [(limit %, colour)] from lowest to highest; green when below them all."""
+    colour = "green"
+    for lim, c in limits:
+        if p > lim / 100:
+            colour = c
+    return colour
+
+
+def check_colour(text: str):
+    return "green" if text.startswith("✓") else ("yellow" if text.startswith("◐") else "red")
+
+
+def sample_rows(row, smp, cur, show_truth, extras=False):
+    """(rows, colours) for the sample table. Colours: green fine, red reject/wrong, orange wood risk, blue label."""
+    rows, colours = chance_rows(row), {}
+    colours["Chance of peanut shell"] = chance_colour(row.p_peanut, [(PEANUT, "blue")])
+    colours["Chance of walnut shell"] = chance_colour(row.p_walnut, [(WALNUT, "blue")])
+    colours["Chance of wood dust"] = chance_colour(row.p_wood, [(WOOD_LAB, "orange"), (WOOD_REJECT, "red")])
     rows["Estimated filler amount"] = estimate_text(cur)
     if show_truth:
         est, m = level_estimate(cur)
@@ -375,18 +395,163 @@ def sample_table(row, smp, cur, show_truth) -> pd.DataFrame:
         rows["Ground truth"] = truth_name(smp)
         rows["Verdict was"] = verdict_check(row, smp)
         rows["Amount estimate was"] = f"{'✓' if off <= m else '✗'} off by {off:.0f} points"
+        colours["Verdict was"] = check_colour(rows["Verdict was"])
+        colours["Amount estimate was"] = check_colour(rows["Amount estimate was"])
     else:
         rows["Ground truth"] = "hidden until you record a decision"
-    rows["Compared with"] = f"the {TRUTH[smp.code].lower()} supplier's reference sample"
-    rows.update({"L* (lightness)": f"{smp.L:.1f}", "a* (green to red)": f"{smp.a:.1f}",
-                 "b* (blue to yellow)": f"{smp.b:.1f}", "ΔE to the reference": f"{reference_delta(cur):.1f}"})
-    return pd.DataFrame({"This sample": rows})
+    if extras:
+        rows["Chance of any filler"] = pct(row.p_any, 0)
+        rows["Compared with"] = f"the {TRUTH[smp.code].lower()} supplier's reference sample"
+        rows.update({"L* (lightness)": f"{smp.L:.1f}", "a* (green to red)": f"{smp.a:.1f}",
+                     "b* (blue to yellow)": f"{smp.b:.1f}", "ΔE to the reference": f"{reference_delta(cur):.1f}"})
+    return rows, colours
+
+
+def styled(columns: dict):
+    """columns: {name: (rows, colours)} -> a colour-coded table."""
+    df = pd.DataFrame({name: rc[0] for name, rc in columns.items()})
+
+    def paint(col):
+        colours = columns[col.name][1]
+        return [f"background-color: {TINT[colours[k]]}" if k in colours else "" for k in col.index]
+
+    return df.style.apply(paint, axis=0)
+
+
+BANNER = {V.REJECT: ("#d03b3b", "#ffffff"), V.LAB_WOOD: ("#ec835a", "#2c1206"), V.LABEL: ("#2a78d6", "#ffffff"),
+          V.LAB_PURE: ("#fab219", "#2c2006")}
+
+
+def instruction(row) -> str:
+    if row.lane == V.REJECT:
+        return "Discard this lot."
+    if row.lane == V.LAB_WOOD:
+        return "Send to the lab before any use."
+    if row.lane == V.LABEL:
+        return f"Label as: {label_text(row)}."
+    return "Send to the lab to confirm it is pure."
+
+
+def verdict_banner(row):
+    bg, fg = BANNER[row.lane]
+    m = LANE[row.lane]
+    st.markdown(
+        f"""<div style="background:{bg};color:{fg};padding:.9rem 1.2rem;border-radius:10px">
+        <div style="font-size:.85rem;font-weight:600;opacity:.85">① THE VERDICT</div>
+        <div style="font-size:2.1rem;font-weight:800;line-height:1.15">{m['icon']} {m['title']}</div>
+        <div style="font-size:1.15rem;font-weight:600">{instruction(row)}</div></div>""",
+        unsafe_allow_html=True)
+
+
+def truth_badge(row, smp, show):
+    if not show:
+        bg, fg, head, body = "#888780", "#ffffff", "? HIDDEN", "Ground truth appears after you record a decision."
+    else:
+        check = verdict_check(row, smp)
+        kind = check_colour(check)
+        bg, fg, head = {"green": ("#0ca30c", "#ffffff", "✓ RIGHT"), "red": ("#d03b3b", "#ffffff", "✗ WRONG"),
+                        "yellow": ("#fab219", "#2c2006", "◐ PARTLY")}[kind]
+        body = f"It is {truth_name(smp)}." + (f" {check.split(': ', 1)[1].capitalize()}." if ": " in check else "")
+    st.markdown(
+        f"""<div style="background:{bg};color:{fg};padding:.9rem 1.2rem;border-radius:10px;height:100%">
+        <div style="font-size:.85rem;font-weight:600;opacity:.85">WAS THE SCREEN RIGHT?</div>
+        <div style="font-size:2.1rem;font-weight:800;line-height:1.15">{head}</div>
+        <div style="font-size:1rem">{body}</div></div>""",
+        unsafe_allow_html=True)
 
 
 def append_log(row: dict):
     if LOG.exists() and pd.read_csv(LOG, nrows=0).columns.tolist() != LOG_COLUMNS:
         LOG.rename(LOG.with_name("decision_log_old.csv"))  # older format: kept, not mixed in
     pd.DataFrame([row], columns=LOG_COLUMNS).to_csv(LOG, mode="a", header=not LOG.exists(), index=False)
+
+
+ZONE_COLOUR = {"below": "#9c9a92", "label": "#2a78d6", "lab": "#ec835a", "reject": "#d03b3b"}
+
+
+def filler_meters(row):
+    """Three bars, one per filler, each with its limit(s) drawn as lines."""
+    items = [("Peanut shell", row.p_peanut, [(PEANUT, "label")]),
+             ("Walnut shell", row.p_walnut, [(WALNUT, "label")]),
+             ("Wood dust", row.p_wood, [(WOOD_LAB, "lab"), (WOOD_REJECT, "reject")])]
+    names, vals, colours, words = [], [], [], []
+    for name, v, limits in items:
+        zone, word = "below", "below its limit"
+        for lim, z in limits:
+            if v > lim / 100:
+                zone = z
+                word = {"label": "label it", "lab": "send to lab", "reject": "reject"}[z]
+        names.append(name)
+        vals.append(v)
+        colours.append(ZONE_COLOUR[zone])
+        words.append(f"{pct(v, 0)} · {word}")
+    fig = go.Figure(go.Bar(y=names, x=vals, orientation="h", marker_color=colours, width=0.55, text=words,
+                           textposition="outside", cliponaxis=False, hovertemplate="%{y}: %{x:.1%}<extra></extra>"))
+    for i, (_, _, limits) in enumerate(items):
+        for lim, z in limits:
+            fig.add_shape(type="line", x0=lim / 100, x1=lim / 100, y0=i - 0.42, y1=i + 0.42,
+                          line=dict(color=ZONE_COLOUR[z], width=2, dash="dot"))
+    chart(fig, 190, title="Chance each filler is present (dotted lines are the limits)",
+          xaxis=dict(range=[0, 1.35], tickformat=".0%", showgrid=False, tickvals=[0, 0.25, 0.5, 0.75, 1]),
+          yaxis=dict(autorange="reversed"), showlegend=False)
+
+
+def lab_to_hex(L, a, b) -> str:
+    """CIE L*a*b* (D65) to an sRGB hex colour, for a swatch."""
+    fy = (L + 16) / 116
+    fx, fz = fy + a / 500, fy - b / 200
+
+    def finv(f):
+        return f ** 3 if f ** 3 > 216 / 24389 else (116 * f - 16) / (24389 / 27)
+
+    x, y, z = 0.95047 * finv(fx), finv(fy), 1.08883 * finv(fz)
+    rgb = np.array([[3.2404542, -1.5371385, -0.4985314], [-0.9692660, 1.8760108, 0.0415560],
+                    [0.0556434, -0.2040259, 1.0572252]]) @ np.array([x, y, z])
+    rgb = np.where(rgb <= 0.0031308, 12.92 * rgb, 1.055 * np.clip(rgb, 0, None) ** (1 / 2.4) - 0.055)
+    r, g, bl = (np.clip(rgb, 0, 1) * 255).round().astype(int)
+    return f"#{r:02x}{g:02x}{bl:02x}"
+
+
+def reference_lab(code):
+    return S[IS_REF & (S.code == code).to_numpy()][["L", "a", "b"]].mean().to_numpy()
+
+
+def swatches(smp, cur):
+    ref = reference_lab(smp.code)
+    box = ("display:inline-block;width:64px;height:40px;border-radius:6px;border:1px solid rgba(128,128,128,.4);"
+           "vertical-align:middle")
+    d = reference_delta(cur)
+    look = "hard to see by eye" if d < 2 else ("visible side by side" if d < 5 else "clearly different")
+    st.markdown(
+        f"""<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <div style="text-align:center"><span style="{box};background:{lab_to_hex(*ref)}"></span>
+        <div style="font-size:.8rem;opacity:.75">Supplier's reference</div></div>
+        <div style="text-align:center;font-size:.9rem">ΔE {d:.1f}<br><span style="opacity:.75">{look}</span></div>
+        <div style="text-align:center"><span style="{box};background:{lab_to_hex(smp.L, smp.a, smp.b)}"></span>
+        <div style="font-size:.8rem;opacity:.75">This sample</div></div></div>""",
+        unsafe_allow_html=True)
+    st.caption("Colours as measured by the colorimeter. A screen shows them only approximately.")
+
+
+def decision_path(row):
+    """Which rule decided the verdict, as a row of steps."""
+    steps = [("Wood above reject limit?", row.lane == V.REJECT),
+             ("Wood above lab limit?", row.lane == V.LAB_WOOD),
+             ("Peanut or walnut above label limit?", row.lane == V.LABEL),
+             ("Nothing above a limit", row.lane == V.LAB_PURE)]
+    fired = [i for i, (_, on) in enumerate(steps) if on][0]
+    pills = []
+    for i, (text, on) in enumerate(steps):
+        if i < fired:
+            style, mark = "opacity:.55", "no"
+        elif i == fired:
+            style, mark = f"border:2px solid {LANE[row.lane]['colour']};font-weight:600", LANE_CHOICE[row.lane]
+        else:
+            style, mark = "opacity:.3", "not checked"
+        pills.append(f'<div style="padding:.35rem .6rem;border-radius:8px;border:1px solid rgba(128,128,128,.4);{style}">'
+                     f'{text}<br><span style="font-size:.8rem">{mark}</span></div>')
+    st.markdown('<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:stretch;font-size:.85rem">'
+                + '<div style="align-self:center">→</div>'.join(pills) + "</div>", unsafe_allow_html=True)
 
 
 def how_far_to_trust():
@@ -410,33 +575,57 @@ def page_inspect():
     st.title("Sample screening")
     df = VERD[VERD.pool == POOL].set_index("row")
     pick = st.session_state.get("demo_pick", "Any material")
+    ss = st.session_state
+    ss.setdefault("hist", [])
+    ss.setdefault("pos", -1)
+    ss.setdefault("recorded", {})
+    ss.hist = [h for h in ss.hist if h in df.index]
+    ss.pos = min(ss.pos, len(ss.hist) - 1)
 
-    def draw():
-        choices = df.index[df.cell == pick] if pick in set(df.cell) else df.index
-        st.session_state.cur = int(np.random.default_rng().choice(choices))
-        st.session_state.revealed = None
+    def go_next():
+        if ss.pos < len(ss.hist) - 1:
+            ss.pos += 1
+        else:
+            choices = df.index[df.cell == pick] if pick in set(df.cell) else df.index
+            ss.hist.append(int(np.random.default_rng().choice(choices)))
+            ss.pos = len(ss.hist) - 1
 
-    if st.session_state.get("cur") not in df.index:
-        draw()
-    a, b = st.columns([1, 1.5], gap="large", vertical_alignment="center")
-    a.button("Next sample", on_click=draw, type="primary")
-    show_truth = b.toggle("Show ground truth", True, help="What the dataset says the sample really is, and whether the "
-                          "verdict was right. Turn off to screen blind; it then appears after you record a decision.")
+    def go_prev():
+        ss.pos = max(0, ss.pos - 1)
 
-    cur = st.session_state.cur
+    if ss.pos < 0:
+        go_next()
+    cur = ss.hist[ss.pos]
+    ss.cur = cur
     row, smp = df.loc[cur], S.iloc[cur]
-    revealed = st.session_state.get("revealed") == cur
+    revealed = cur in ss.recorded
+
+    a, b, c, d = st.columns([0.8, 0.8, 1.2, 2.2], vertical_alignment="center")
+    a.button("◀ Previous", on_click=go_prev, disabled=ss.pos == 0, width="stretch")
+    b.button("Next ▶", on_click=go_next, type="primary", width="stretch")
+    c.markdown(f"Sample **{ss.pos + 1}** of **{len(ss.hist)}** viewed")
+    show_truth = d.toggle("Show ground truth", True, help="What the dataset says the sample really is, and whether the "
+                          "verdict was right. Turn off to screen blind; it then appears after you record a decision.")
+    truth_visible = show_truth or revealed
+
+    a, b = st.columns([1.6, 1], gap="medium")
+    with a:
+        verdict_banner(row)
+    with b:
+        truth_badge(row, smp, truth_visible)
 
     left, right = st.columns([1, 1.5], gap="large")
     with left:
         st.image(str(C.THUMBS / f"{smp.sample_id}.jpg"), caption=f"Sample #{cur:04d}")
     with right:
-        lane_card(row)
-        st.dataframe(sample_table(row, smp, cur, show_truth or revealed), width="stretch")
+        st.markdown("**② Why:** the chance of each filler, against the limits in the sidebar")
+        filler_meters(row)
+        st.dataframe(styled({"This sample": sample_rows(row, smp, cur, truth_visible)}), width="stretch")
+        st.caption("Green: below its limit, or right. Blue: label. Orange: wood risk. Red: reject, or wrong.")
 
     a, b = st.columns([1.3, 1], gap="large", vertical_alignment="bottom")
-    decision = a.radio("Your decision", V.LANES, index=V.LANES.index(row.lane), horizontal=True, key=f"decision{cur}",
-                       format_func=LANE_CHOICE.get, disabled=revealed)
+    decision = a.radio("Your decision", V.LANES, index=V.LANES.index(ss.recorded.get(cur, row.lane)), horizontal=True,
+                       key=f"decision{cur}", format_func=LANE_CHOICE.get, disabled=revealed)
     if b.button("Record decision", disabled=revealed):
         append_log(dict(time=dt.datetime.now().isoformat(timespec="seconds"), sample_id=smp.sample_id,
                         model_version=R["meta"]["model_version"], sensors=SENSORS, wood_lab=WOOD_LAB,
@@ -444,17 +633,23 @@ def page_inspect():
                         labels=label_text(row), decision=decision, override=decision != row.lane,
                         sent_to_lab=decision in (V.LAB_WOOD, V.LAB_PURE), user=USER))
         if decision in (V.LAB_WOOD, V.LAB_PURE):
-            st.session_state.setdefault("queue", []).append(
+            ss.setdefault("queue", []).append(
                 dict(sample=f"#{cur:04d}", reason=LANE[decision]["text"], chance_of_filler=float(row.p_any)))
-        st.session_state.revealed = cur
+        ss.recorded[cur] = decision
         st.rerun()
     if decision != row.lane and not revealed:
         st.warning(f"This overrides the recommendation ({LANE_CHOICE[row.lane]}). The override is recorded under your name.")
     if revealed:
-        st.success("Decision recorded. Ground truth is now shown in the table.")
+        st.success(f"Decision recorded for this sample: {LANE_CHOICE[ss.recorded[cur]]}.")
 
-    with st.expander("Details and reasoning"):
+    with st.expander("③ Details and reasoning"):
         st.markdown(f"**Why {LANE[row.lane]['title']}:** {reason(row)}")
+        st.markdown("**How the verdict was reached**")
+        decision_path(row)
+        st.markdown(f"**Compared with** the {TRUTH[smp.code].lower()} supplier's reference sample")
+        swatches(smp, cur)
+        st.markdown(f"Colour reading: L\\* {smp.L:.1f} (lightness) · a\\* {smp.a:.1f} (green to red) · "
+                    f"b\\* {smp.b:.1f} (blue to yellow) · ΔE to the reference {reference_delta(cur):.1f}")
         t3, tl = ART["supplier"][SENSORS]["types"]
         p = (tl if POOL == "locked" else t3)[cur]
         st.markdown(f"**How the chances are worked out.** Chance of any filler (from the amount-band model): "
@@ -469,7 +664,7 @@ def page_inspect():
 
     with st.expander("How to read this page"):
         st.markdown(
-            "1. Press **Next sample**. The screen compares the photo and colour reading with the supplier's reference.\n"
+            "1. Press **Next ▶** for a new sample, **◀ Previous** to go back. The screen compares the photo and colour reading with the supplier's reference.\n"
             "2. It works out the chance that each filler is present and gives one verdict:\n"
             f"   - {LANE_CHOICE[V.REJECT]}: wood dust above the reject limit. Discard the lot.\n"
             f"   - {LANE_CHOICE[V.LAB_WOOD]}: wood dust above the lab limit. Confirm before any use.\n"
@@ -496,6 +691,128 @@ def page_inspect():
         st.selectbox("Draw the next sample from", cells, key="demo_pick",
                      format_func=lambda c: c if c == "Any material" else cell_name(c),
                      help="For rehearsing the demo. An inspector would not know this.")
+
+
+# ---------------------------------------------------------------- How it works
+WORKFLOW_DOT = """
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.32;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, color="#9c9a92",
+        fillcolor="#f1efe8", fontcolor="#2c2c2a", margin="0.12,0.06"];
+  edge [color="#9c9a92", fontname="Helvetica", fontsize=9, fontcolor="#888780"];
+  lot [label="1. Lot arrives\nfrom a supplier"];
+  sample [label="2. Take a sample\nphoto + colour reading"];
+  ref [label="3. Compare with that\nsupplier's reference"];
+  models [label="4. Models estimate the\nchance of each filler"];
+  rules [label="5. Verdict rules\n(limits in the sidebar)"];
+  reject [label="Reject\ndiscard the lot", fillcolor="#f7c1c1", fontcolor="#501313", color="#a32d2d"];
+  labw [label="Lab: wood risk\nconfirm before use", fillcolor="#fac775", fontcolor="#412402", color="#854f0b"];
+  label [label="Label\npeanut and/or walnut", fillcolor="#b5d4f4", fontcolor="#042c53", color="#185fa5"];
+  labp [label="Lab: verify pure", fillcolor="#faeeda", fontcolor="#412402", color="#854f0b"];
+  record [label="6. Inspector decides\nand records it"];
+  result [label="7. Lab result\non file"];
+  {rank=same; lot; sample; ref;}
+  {rank=same; models; rules;}
+  {rank=same; reject; labw; label; labp;}
+  {rank=same; record; result;}
+  lot -> sample -> ref; ref -> models; models -> rules;
+  rules -> reject; rules -> labw; rules -> label; rules -> labp;
+  reject -> record; labw -> record; label -> record; labp -> record;
+  record -> result;
+  result -> ref [style=dashed, constraint=false, tooltip="Confirmed lots build the supplier's track record"];
+}
+"""
+
+
+def before_after_chart():
+    """Raw colour against colour relative to each supplier's reference."""
+    s = S[~S.locked].copy()
+    refs = {c: reference_lab(c) for c in C.FOLDERS}
+    ref_rows = np.vstack([refs[c] for c in s.code])
+    s["dL"], s["da"] = s.L - ref_rows[:, 0], s.a - ref_rows[:, 1]
+    is_ref = IS_REF[~S.locked.to_numpy()]
+    pure = (s.level == 0).to_numpy()
+    left, right = st.columns(2, gap="large")
+    for col, (x, y, title, xt, yt) in zip((left, right), (
+            ("a", "L", "Raw colour", "a* (green → red)", "L* (dark → light)"),
+            ("da", "dL", "Colour minus the supplier's reference", "a* difference", "L* difference"))):
+        fig = go.Figure()
+        for code in C.FOLDERS:
+            m = (s.code == code).to_numpy() & ~pure
+            fig.add_trace(go.Scatter(x=s[x][m], y=s[y][m], mode="markers", name=f"{TRUTH[code]} blends",
+                                     marker=dict(size=5, color=FILLER_COLOUR[code], opacity=0.25),
+                                     hovertemplate=f"{TRUTH[code]} blend<extra></extra>"))
+        for code, sym in zip(C.FOLDERS, ("circle", "diamond", "square")):
+            m = (s.code == code).to_numpy() & pure & (~is_ref if x == "da" else True)
+            fig.add_trace(go.Scatter(x=s[x][m], y=s[y][m], mode="markers", name=f"Pure, {TRUTH[code].lower()} supplier",
+                                     marker=dict(size=10, symbol=sym, color="#2c2c2a", line=dict(color="white", width=1.5)),
+                                     hovertemplate=f"Pure cinnamon, {TRUTH[code].lower()} supplier<extra></extra>"))
+        if x == "da":
+            fig.add_trace(go.Scatter(x=[0], y=[0], mode="markers", name="The supplier's reference",
+                                     marker=dict(size=16, symbol="star", color="#eda100", line=dict(color="white", width=1.5)),
+                                     hovertemplate="Reference<extra></extra>"))
+        with col:
+            chart(fig, 380, title=title, xaxis=dict(title=xt, zeroline=False), yaxis=dict(title=yt, zeroline=False),
+                  legend=dict(orientation="h", y=-0.25, font=dict(size=11)))
+    st.caption("Each dot is one sample's colorimeter reading. **Left:** the three pure batches (dark shapes) sit far "
+               "apart, so there is no single “pure cinnamon” colour to learn. **Right:** the same readings measured from "
+               "each supplier's own reference (star). Every pure batch now lands on the star, so “how far from this "
+               "supplier's normal” means the same thing for every supplier. Peanut-shell and wood-dust blends sit clearly "
+               "away from the star in colour. Walnut-shell blends sit close to it in colour alone; the photo features are "
+               "what separate those, which is why the screen uses colour and photo together.")
+
+
+def page_how():
+    st.title("How it works")
+    st.info("**In one sentence:** the screen checks each delivery against a known-pure sample from the same supplier, "
+            "estimates the chance of each filler, and turns that into one of four verdicts. It supplements lab "
+            "testing; it does not replace it.")
+    st.subheader("1 · The workflow")
+    st.graphviz_chart(WORKFLOW_DOT, width="content")
+    st.markdown(
+        "1. **A lot arrives** from a supplier whose pure reference sample is already on file.\n"
+        "2. **A small sample is ground and measured:** one photo in a dish and one colorimeter reading. No lab needed.\n"
+        "3. **It is compared with that supplier's reference.** The screen looks at how far the sample is from the "
+        "supplier's normal, not at its colour on its own.\n"
+        "4. **Three simple models** estimate: is there any filler, which filler it would be, and roughly how much. "
+        "They combine into a chance that each filler is present.\n"
+        "5. **The verdict rules** set by the QC manager turn those chances into one verdict: reject, lab for wood risk, "
+        "label, or lab to verify pure.\n"
+        "6. **The inspector decides** and records the decision; the tool only recommends.\n"
+        "7. **Lab results go on file.** Confirmed lots build each supplier's track record.")
+
+    st.subheader("2 · Why every sample is compared with its supplier's reference")
+    before_after_chart()
+
+    st.subheader("3 · New suppliers and new kinds of cinnamon")
+    ns = R["reference"]["new_supplier"]
+    st.markdown(
+        "Cinnamon differs by origin, species and batch, so the screen doesn't carry one fixed idea of “pure”. "
+        "It carries the supplier's own reference. Bringing on a new supplier, or a new kind of cinnamon, works like this:\n\n"
+        "1. **Get a reference sample** of the supplier's pure cinnamon and have the lab confirm it is pure.\n"
+        "2. **Register it.** The screen measures it once and stores it as that supplier's normal.\n"
+        "3. **Screen every lot against it.** The models don't need retraining: they learned how fillers move a "
+        "sample away from its reference, which carries over to a new reference.\n"
+        "4. **Check early lots at the lab too.** Each confirmed lot adds to the supplier's track record.\n"
+        "5. **A different kind of cinnamon** (for example cassia instead of Ceylon) gets its own reference, "
+        "even from the same supplier.")
+    st.markdown("**How well this carries over, on this dataset.** Each supplier was held out completely: the models "
+                "never saw its samples and were given only its reference.")
+    rows = []
+    for ss in ("colour+image", "all", "colour", "ftir"):
+        v = ns[ss]
+        rows.append({"Instruments": SET_LABEL[ss], "Blends flagged": pct(v["blends_flagged"], 0),
+                     "Pure samples recognised": pct(v["pure_recognised"], 0),
+                     "Blends flagged, by supplier": ", ".join(f"{TRUTH[c].split()[0]} {pct(x['blends_flagged'], 0)}"
+                                                             for c, x in v["by_supplier"].items())})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.warning(
+        "**What this does not prove yet.**\n"
+        "- The dataset has only three suppliers' pure batches, so “works for other cinnamon” is promising, not shown.\n"
+        "- Some instruments carry over badly: FTIR alone missed the peanut blends of a new supplier.\n"
+        "- The pure samples tested share a batch with their reference, so pure-cinnamon results are optimistic.\n"
+        "- A filler the models have never seen (cassia, lead chromate, other dust) would still be named as one of the three.\n"
+        "- A pilot would need many independent lots per supplier, each confirmed at the lab.")
 
 
 # ---------------------------------------------------------------- Compare
@@ -544,8 +861,8 @@ def page_compare():
         st.warning(f"The verdicts differ: sample A gets **{LANE_CHOICE[ra.lane]}**, sample B gets **{LANE_CHOICE[rb.lane]}**.")
     left, right = st.columns([1.25, 1], gap="large")
     with left:
-        ta, tb = sample_table(ra, sa, ca, True), sample_table(rb, sb, cb, True)
-        st.dataframe(pd.DataFrame({"Sample A": ta["This sample"], "Sample B": tb["This sample"]}), width="stretch")
+        st.dataframe(styled({"Sample A": sample_rows(ra, sa, ca, True, extras=True),
+                             "Sample B": sample_rows(rb, sb, cb, True, extras=True)}), width="stretch")
     with right:
         fig = go.Figure()
         names = ["Peanut shell", "Walnut shell", "Wood dust"]
@@ -577,6 +894,24 @@ def verdict_crosstab(df: pd.DataFrame) -> pd.DataFrame:
                      columns=[c for c in OUTCOME_ORDER if c in t.columns], fill_value=0)
 
 
+OUTCOME_COLOUR = {"✕ Reject": "#d03b3b", "⚠ Lab (wood risk)": "#ec835a", "🏷 Label peanut": "#2a78d6",
+                  "🏷 Label walnut": "#6250d6", "🏷 Label both": "#1baf7a", "⧖ Lab (verify pure)": "#fab219"}
+
+
+def verdict_bars(ct: pd.DataFrame):
+    """One bar per kind of sample, split by the verdict it got."""
+    share = ct.div(ct.sum(axis=1), axis=0)
+    fig = go.Figure()
+    for col in ct.columns:
+        fig.add_trace(go.Bar(y=ct.index, x=share[col], name=col, orientation="h", marker_color=OUTCOME_COLOUR[col],
+                             marker_line=dict(color="rgba(0,0,0,0)", width=0), customdata=ct[col],
+                             text=[pct(v, 0) if v >= 0.06 else "" for v in share[col]], textposition="inside",
+                             hovertemplate="%{y} → " + col + ": %{customdata} samples (%{x:.0%})<extra></extra>"))
+    chart(fig, 260, barmode="stack", bargap=0.35, title="What each kind of sample was told",
+          xaxis=dict(tickformat=".0%", range=[0, 1], showgrid=False), yaxis=dict(autorange="reversed"),
+          legend=dict(orientation="h", y=-0.2))
+
+
 def page_scoreboard():
     st.title("Scoreboard")
     st.caption(f"How the verdicts do on materials the models had never seen. Instruments: {SET_LABEL[SENSORS]} · limits: "
@@ -586,6 +921,11 @@ def page_scoreboard():
             "same batch as the reference.")
     dev = VERD[VERD.pool == "dev"]
     m = V.summary(dev)
+    good = m["wood_let_through"] == 0 and m["filler_missed"] == 0
+    st.markdown(f"### {'✓' if good else '⚠'} On materials it had never seen, the screen "
+                + (f"let no wood through and missed no filler. {pct(m['right'])} of verdicts were right." if good else
+                   f"let {pct(m['wood_let_through'])} of wood through and missed {pct(m['filler_missed'])} of filler. "
+                   f"{pct(m['right'])} of verdicts were right."))
     st.subheader("1 · At a glance")
     cards = [
         ("Wood let through", m["wood_let_through"], m["wood_let_through"] == 0, "target 0%",
@@ -605,6 +945,7 @@ def page_scoreboard():
         col.caption(f"{'✓' if ok else '✗'} {target}. {text}")
 
     st.subheader("2 · Every verdict, by what the sample really is")
+    verdict_bars(verdict_crosstab(dev))
     st.dataframe(verdict_crosstab(dev), width="stretch")
     st.caption(f"{m['n']:,} samples from {m['materials']} materials. Rows are the truth, columns the verdict.")
 
@@ -731,6 +1072,7 @@ def page_log():
 
 st.navigation([
     st.Page(page_inspect, title="Inspect", icon=":material/search:", url_path="inspect", default=True),
+    st.Page(page_how, title="How it works", icon=":material/account_tree:", url_path="how-it-works"),
     st.Page(page_compare, title="Compare", icon=":material/compare_arrows:", url_path="compare"),
     st.Page(page_scoreboard, title="Scoreboard", icon=":material/scoreboard:", url_path="scoreboard"),
     st.Page(page_evidence, title="Evidence", icon=":material/fact_check:", url_path="evidence"),
