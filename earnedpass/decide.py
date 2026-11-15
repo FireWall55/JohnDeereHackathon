@@ -26,6 +26,7 @@ class Settings:
     must_catch: int = C.MUST_CATCH
     bar: float = C.PASS_BAR
     sensor_set: str = C.SCREEN_SET
+    wood_hold: float | None = None  # HOLD when filler is possible and P(wood) is above this; None = off
 
 
 @dataclass
@@ -40,6 +41,8 @@ class Probs:
     p1: np.ndarray
     p3: np.ndarray
     pl: np.ndarray
+    w3: np.ndarray | None = None  # P(wood dust) from the filler model, judged like p3
+    wl: np.ndarray | None = None  # the same for the locked cells
 
     @property
     def locked_scored(self) -> bool:
@@ -250,6 +253,17 @@ def evaluate(samples, probs: Probs, st: Settings) -> Result:
     cl = claims(df, st.must_catch)
     lic = licence(cl, st.mode, st.bar)
     df["lane"] = np.where((df.candidate == "PASS") & (not lic["licensed"]), "LAB", df.candidate)
+    df["p_wood"] = np.nan
+    df["wood_hold"] = False
+    if probs.w3 is not None:
+        wl = probs.wl if probs.wl is not None else np.full_like(probs.w3, np.nan)
+        df["p_wood"] = np.where(df.pool == "dev", probs.w3[df.row], wl[df.row])
+        if st.wood_hold is not None:
+            # Only where filler is still possible: a shortlist of exactly {0%} means no filler is
+            # suspected. An empty shortlist (nothing fits) counts as possible filler.
+            filler_possible = ~(df.in_zero & ~df.in_low & ~df.in_mid & ~df.in_high)
+            df["wood_hold"] = (filler_possible & (df.p_wood > st.wood_hold)).to_numpy()
+            df["lane"] = np.where(df.wood_hold, "HOLD", df.lane)
     held = np.where(df.pool.to_numpy()[:, None] == "dev", probs.p3[df.row], probs.pl[df.row])
     p_held = np.full_like(probs.p3, np.nan)
     p_held[df.row] = held
@@ -263,6 +277,9 @@ def reason(row, res: Result) -> str:
     st, lic = res.settings, res.licence
     unit = "samples" if st.mode == "as_labelled" else "independent cells"
     kept = row["set"]
+    if row.get("wood_hold", False):
+        return (f"Wood dust cannot be ruled out: the filler model gives it {row.p_wood:.0%}, above the "
+                f"{st.wood_hold:.0%} limit. Wood is never accepted, so the lot is held for lab confirmation.")
     if row.lane == "HOLD":
         return (f"Every band the screen cannot rule out ({kept}) is at or above the {st.must_catch}% must-catch level: "
                 "strong suspicion, confirm at the lab first.")

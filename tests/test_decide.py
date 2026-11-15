@@ -54,3 +54,22 @@ def test_wrong_pass_breaks_the_catch_claim():
     t = a.tiles.set_index("cell")
     assert t.loc["CP6", "status"] == "wrong" and t.loc["CP8", "status"] == "right"
     assert a.baseline["wrong_auto_decisions"] == 50
+
+
+def test_wood_rule_holds_possible_wood_but_never_touches_no_filler_samples():
+    s, probs = _perfect()
+    lab_like = (s.cell == "CD2").to_numpy()  # a low wood blend the screen cannot narrow down
+    probs.p3[lab_like] = [0.3, 0.4, 0.3, 0.0]
+    w = np.where(s.code == "D", 0.9, 0.01)
+    w[(s.level == 0).to_numpy()] = 0.9  # pure samples may still get a wood guess
+    probs = decide.Probs(probs.p1, probs.p3, probs.pl, w3=w)
+    off = decide.evaluate(s, probs, decide.Settings())
+    on = decide.evaluate(s, probs, decide.Settings(wood_hold=0.05))
+    cd2 = on.df.cell == "CD2"
+    assert (off.df.lane[cd2] == "LAB").all() and (on.df.lane[cd2] == "HOLD").all()
+    assert "Wood dust cannot be ruled out" in decide.reason(on.df[cd2].iloc[0], on)
+    pure = on.df.level == 0  # shortlist {0%}: no filler suspected, so the wood rule does not apply
+    assert not on.df.wood_hold[pure].any()
+    assert on.claims == off.claims  # the PASS evidence is unchanged
+    nut = (on.df.code != "D") & (on.df.level > 0)
+    assert not on.df.wood_hold[nut].any()
